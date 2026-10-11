@@ -1,0 +1,60 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Accord Console backend - Claude proxy (Bedrock) and shared game storage
+
+Parameters:
+  ModelId:
+    Type: String
+    Default: global.anthropic.claude-sonnet-4-6
+    Description: Bedrock model / inference profile used for statement grading and AI seats
+  AllowedOrigin:
+    Type: String
+    Default: "*"
+    Description: Frontend origin allowed by CORS (set to the CloudFront URL once it exists)
+
+Globals:
+  Function:
+    Runtime: nodejs22.x
+    Architectures: [arm64]
+    MemorySize: 256
+
+Resources:
+  Api:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: [!Ref AllowedOrigin]
+        AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
+        AllowHeaders: [content-type]
+      DefaultRouteSettings:
+        ThrottlingBurstLimit: 20
+        ThrottlingRateLimit: 10
+
+  AiFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ai/
+      Handler: index.handler
+      Timeout: 60
+      Environment:
+        Variables:
+          MODEL_ID: !Ref ModelId
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: bedrock:InvokeModel
+              Resource:
+                - arn:aws:bedrock:*::foundation-model/anthropic.*
+                - !Sub arn:aws:bedrock:*:${AWS::AccountId}:inference-profile/*
+      Events:
+        Ai:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /ai
+            Method: POST
+
+Outputs:
+  ApiUrl:
+    Description: Base URL for VITE_API_URL
+    Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com

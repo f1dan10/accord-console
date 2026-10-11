@@ -380,6 +380,8 @@ function receptionLabel(net) {
    It is inserted into release builds from a private file. The placeholder keeps the
    grader working end to end: three dimensions, each scored 0–5, plus relevance 0–3. */
 const RUBRIC_TEXT = "DIMENSION A (placeholder): 0-5, how well the statement is supported.\nDIMENSION B (placeholder): 0-5, how well the statement is argued.\nDIMENSION C (placeholder): 0-5, how well the statement resonates with its audience.";
+/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is chosen server-side. */
+const AI_URL = `${import.meta.env.VITE_API_URL}/ai`;
 const RUBRIC_LABELS = ["Dimension A", "Dimension B", "Dimension C"];
 async function scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars }) {
   const exBlock = exemplars && exemplars.length
@@ -398,14 +400,10 @@ Communiqué text:
 """${text}"""${exBlock}
 
 Respond ONLY with a JSON object, no preamble, no markdown fences: {"e": n, "l": n, "p": n, "ad_hominem": bool, "relevance": n}`;
-  const response = await fetch("https://api.anthropic.com/v1/messages", {
+  const response = await fetch(AI_URL, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      model: "claude-sonnet-4-6",
-      max_tokens: 1000,
-      messages: [{ role: "user", content: prompt }],
-    }),
+    body: JSON.stringify({ prompt, max_tokens: 1000 }),
   });
   const data = await response.json();
   const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
@@ -688,7 +686,7 @@ function useShared(pollMs = 4000) {
     };
     doProbe();
     const t2 = setInterval(doProbe, 30000);
-    return () => { clearInterval(t); clearInterval(t2); };
+    return () => { clearInterval(t); clearInterval(t2); document.removeEventListener("visibilitychange", onVis); window.removeEventListener("focus", onVis); };
   }, [pull, pollMs]);
 
   return { clock, props, endo, injects, flags, pub, comms, ann, aiCtl, pull, sync };
@@ -1038,10 +1036,10 @@ async function composeAiCommunique(team, { subject, posture, leadTeam, moodDispa
       : `${MINISTRY[team].speaker} cannot accept the ${leadTeam} text as drafted${worstIss ? `, above all on ${worstIss.label.toLowerCase().replace(/\?$/, "")}` : ""}. A durable agreement will not be built on terms our public cannot defend.`;
   try {
     const prompt = `You write one official communiqué (max 380 characters, no quotation marks around it, no preamble) for ${MINISTRY[team].wire} in ${PD.scoringContext}. Posture: ${posture}. Subject: ${subjectLabel}. Current press climate: "${moodDispatch}". Speak in the institutional first-person plural of ${MINISTRY[team].speaker}. Be specific and rhetorically strong — cite a principle or fact, reason clearly, and match the public temperature. Output ONLY the statement text.`;
-    const res = await fetch("https://api.anthropic.com/v1/messages", {
+    const res = await fetch(AI_URL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ model: "claude-sonnet-4-6", max_tokens: 300, messages: [{ role: "user", content: prompt }] }),
+      body: JSON.stringify({ prompt, max_tokens: 300 }),
     });
     const data = await res.json();
     const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
@@ -1714,7 +1712,7 @@ function Facilitator({ sh }) {
     };
     poll();
     const t = setInterval(poll, 6000);
-    return () => { alive = false; clearInterval(t); document.removeEventListener("visibilitychange", onVis); window.removeEventListener("focus", onVis); };
+    return () => { alive = false; clearInterval(t); };
   }, []);
   useEffect(() => { const t = setInterval(() => setNow(Date.now()), 1000); return () => clearInterval(t); }, []);
 

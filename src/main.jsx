@@ -2,7 +2,7 @@ import { StrictMode } from 'react'
 import { createRoot } from 'react-dom/client'
 import './index.css'
 
-const API = "https://7q2pijegeat4couj46ksjk45wi0ixdtc.lambda-url.us-east-2.on.aws/";
+const API = import.meta.env.VITE_STORAGE_URL || "https://7q2pijegeat4couj46ksjk45wi0ixdtc.lambda-url.us-east-2.on.aws/";
 const SESSION = new URLSearchParams(location.search).get("s") || "default";
 const url = (k) => `${API}?s=${encodeURIComponent(SESSION)}&k=${encodeURIComponent(k)}`;
 
