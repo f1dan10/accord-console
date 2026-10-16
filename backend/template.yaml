@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Accord Console backend - Claude proxy (Bedrock) and shared game storage
+Description: Accord Console backend - Claude proxy (Bedrock), accounts (Cognito) and game storage (DynamoDB)
 
 Parameters:
   ModelId:
@@ -11,6 +11,10 @@ Parameters:
     Type: String
     Default: "*"
     Description: Frontend origin allowed by CORS (set to the CloudFront URL once it exists)
+  ProfessorEmails:
+    Type: String
+    Default: ""
+    Description: Comma-separated emails that sign in with the professor role; everyone else is a student
 
 Globals:
   Function:
@@ -25,10 +29,128 @@ Resources:
       CorsConfiguration:
         AllowOrigins: [!Ref AllowedOrigin]
         AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
-        AllowHeaders: [content-type]
+        AllowHeaders: [content-type, authorization]
       DefaultRouteSettings:
         ThrottlingBurstLimit: 20
         ThrottlingRateLimit: 10
+      # Opt-in per route (Auth: Authorizer: CognitoJwt); /ai stays public.
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: accord-web
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: hours
+        RefreshToken: days
+
+  # Stamps a `role` claim (professor | student) onto every ID token.
+  RoleClaimFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: auth/
+      Handler: preToken.handler
+      Timeout: 5
+      Environment:
+        Variables:
+          PROFESSOR_EMAILS: !Ref ProfessorEmails
+      Events:
+        PreToken:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PreTokenGeneration
+
+  GamesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: gameId, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+        - { AttributeName: updatedAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: gameId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+            - { AttributeName: updatedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Game state document (gzip), kept apart from Games so listings stay small.
+  GameDocsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: gameId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: gameId, KeyType: HASH }
+
+  MembersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: gameId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: gameId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byGame
+          KeySchema:
+            - { AttributeName: gameId, KeyType: HASH }
+            - { AttributeName: userId, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Active join words -> gameId. Rows are removed when a game is completed.
+  CodesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: code, AttributeType: S }
+      KeySchema:
+        - { AttributeName: code, KeyType: HASH }
 
   AiFunction:
     Type: AWS::Serverless::Function
@@ -58,3 +180,9 @@ Outputs:
   ApiUrl:
     Description: Base URL for VITE_API_URL
     Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Description: Value for VITE_COGNITO_USER_POOL_ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Value for VITE_COGNITO_CLIENT_ID
+    Value: !Ref UserPoolClient

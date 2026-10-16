@@ -1,0 +1,7 @@
+{
+  "name": "accord-auth",
+  "private": true,
+  "type": "module",
+  "main": "preToken.mjs",
+  "version": "1.0.0"
+}
