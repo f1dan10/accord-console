@@ -3,6 +3,8 @@ import {
   authConfigured, currentUser, onAuthChange, signIn, signUp, signOut,
   confirmSignUp, resendCode, forgotPassword, resetPassword,
 } from "./auth.js";
+import { api } from "./api.js";
+import { setActiveGame, getActiveGame } from "./storage.js";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -523,6 +525,19 @@ let authoritativeDoc = null;   // in-memory doc threaded through THIS client's w
 let localWrites = {};          // key -> ts of our last local write (propagation guard)
 let docInflight = null;
 let docWriteChain = Promise.resolve();
+/* Opening a different game drops everything cached for the previous one.
+   docGen tags each read/write with the game it started in, so a request still
+   in flight for the old game can neither land in the cache nor be written
+   into the new game's document. */
+let docGen = 0;
+function resetDocState() {
+  docGen += 1;
+  docCache = { ts: 0, data: null };
+  authoritativeDoc = null;
+  localWrites = {};
+  docInflight = null;
+  docWriteChain = Promise.resolve();
+}
 
 /* Physical read, folded into the authoritative doc. Other clients' changes
    are adopted, EXCEPT keys we ourselves wrote within WRITE_PROTECT_MS —
@@ -532,9 +547,11 @@ let docWriteChain = Promise.resolve();
 async function readDoc(force) {
   if (!force && docCache.data && Date.now() - docCache.ts < DOC_CACHE_MS) return docCache.data;
   if (!force && docInflight) return docInflight;
+  const gen = docGen;
   const p = (async () => {
     try {
       const r = await withTimeout(window.storage.get(DOC_KEY, true));
+      if (gen !== docGen) return {};
       const physical = r ? JSON.parse(r.value) : {};
       const now = Date.now();
       const merged = { ...physical };
@@ -546,9 +563,10 @@ async function readDoc(force) {
       authoritativeDoc = merged;
       docCache = { ts: now, data: merged };
     } catch {
+      if (gen !== docGen) return {};
       if (!docCache.data) docCache = { ts: Date.now(), data: authoritativeDoc || {} };
       if (!authoritativeDoc) authoritativeDoc = docCache.data;
-    } finally { docInflight = null; }
+    } finally { if (gen === docGen) docInflight = null; }
     return docCache.data;
   })();
   if (!force) docInflight = p;
@@ -558,7 +576,9 @@ async function readDoc(force) {
    physical re-read between our own writes, so two writes from this client
    (e.g. a seat toggle and an AI-host draft) can never clobber each other. */
 function writeDoc(mutate) {
+  const gen = docGen;
   const job = docWriteChain.then(async () => {
+    if (gen !== docGen) return false;
     /* Always refresh from physical before mutating. writeDoc rebuilds the WHOLE
        document, so a stale base silently drops another client's recent change to
        a different key (team endorses; facilitator opens a press window one second
@@ -566,6 +586,7 @@ function writeDoc(mutate) {
        one get per write and is merged under WRITE_PROTECT_MS, so our own recent
        writes are still preserved. */
     await readDoc(true);
+    if (gen !== docGen) return false;
     const base = authoritativeDoc || {};
     const next = mutate({ ...base });
     const now = Date.now();
@@ -643,6 +664,11 @@ const DEFAULT_PUB = {
    B and reports a false "NOT SYNCING". Each session now probes its own key. */
 const CLIENT_ID = Math.random().toString(36).slice(2, 10);
 async function probeStorage() {
+  /* A game's document is the only shared key, and a paused game or an
+     unassigned student may not write it, so reading it is the probe. */
+  if (getActiveGame()) {
+    try { await withTimeout(window.storage.get(DOC_KEY, true)); return true; } catch { return false; }
+  }
   try {
     const stamp = String(Date.now());
     const key = `${P}-probe-${CLIENT_ID}`;
@@ -3321,14 +3347,104 @@ function AccountHome({ user, onUseCode }) {
   );
 }
 
+/* One mounted game. Keyed by game id by its parent, so polling, timers and
+   the AI host all start fresh when a different game is opened. */
+function GameRoom({ kind, team, observer }) {
+  const sh = useShared(5000);
+  if (kind === "projector") return <Projector sh={sh} />;
+  if (kind === "facilitator") return <Facilitator sh={sh} />;
+  return <TeamView team={team} sh={sh} observer={!!observer} />;
+}
+
+function GameMessage({ title, message, onLeave }) {
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
+      <div className="w-full max-w-sm text-center" style={{ color: PAPER }}>
+        <div className="mb-6"><Wordmark light h="36px" /></div>
+        {title && <h1 className="text-lg font-bold mb-3" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>{title.toUpperCase()}</h1>}
+        <div className="text-sm mb-6" style={{ opacity: 0.85 }}>{message}</div>
+        {onLeave && <button onClick={onLeave} className="text-sm" style={AUTH_LINK}>Back to your account</button>}
+      </div>
+    </div>
+  );
+}
+
+/* Opens game `gameId` for the signed-in user: the owner gets the facilitator
+   console (or the projector with ?view=projector), a student gets their
+   assigned delegation. Shared storage is pointed at this game's document
+   before the room mounts. A student still waiting for a seat is re-checked
+   every few seconds. */
+function GameEntry({ gameId, view, onLeave }) {
+  const [state, setState] = useState({ phase: "loading" });
+
+  useEffect(() => {
+    let alive = true, timer = null;
+    const load = async () => {
+      try {
+        const { game, membership } = await api("GET", `/games/${encodeURIComponent(gameId)}`);
+        if (!alive) return;
+        const owner = game.ownerId === membership.userId;
+        let room = null, wait = null;
+        if (owner) room = { kind: view === "projector" ? "projector" : "facilitator" };
+        else if (game.status === "paused") wait = "This game is paused. Your professor will resume it.";
+        else if (!membership.delegation) wait = "You're in. Waiting for your professor to assign your delegation.";
+        else if (membership.delegation === "observer") room = { kind: "projector" };
+        else if (TEAMS.includes(membership.delegation)) room = { kind: "team", team: membership.delegation };
+        else wait = `Your delegation "${membership.delegation}" isn't part of this scenario. Ask your professor to reassign you.`;
+        if (room) {
+          if (getActiveGame() !== gameId) { setActiveGame(gameId); resetDocState(); }
+          setState({ phase: "room", room, game });
+        } else {
+          setState({ phase: "wait", message: wait, game });
+          timer = setTimeout(load, 5000);
+        }
+      } catch (e) {
+        if (alive) setState({ phase: "error", message: e.message });
+      }
+    };
+    load();
+    return () => { alive = false; clearTimeout(timer); };
+  }, [gameId, view]);
+
+  // Leaving the game (or switching to another) detaches storage from it.
+  useEffect(() => () => { setActiveGame(null); resetDocState(); }, [gameId]);
+
+  if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
+  if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;
+  if (state.phase === "wait") return <GameMessage title={state.game.title} message={state.message} onLeave={onLeave} />;
+  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}`} {...state.room} />;
+}
+
+/* ?game=<id>[&view=projector] in the address bar is the open game, so a
+   refresh mid-class lands back in it and Back returns to the account page. */
+const readRoute = () => {
+  const q = new URLSearchParams(location.search);
+  return { gameId: q.get("game"), view: q.get("view") };
+};
+function openGame(gameId, view) {
+  const q = new URLSearchParams(location.search);
+  q.delete("game"); q.delete("view");
+  if (gameId) q.set("game", gameId);
+  if (gameId && view) q.set("view", view);
+  const qs = q.toString();
+  history.pushState(null, "", `${location.pathname}${qs ? `?${qs}` : ""}`);
+  window.dispatchEvent(new PopStateEvent("popstate"));
+}
+
 export default function App() {
   useFontEmbed();
   const [user, setUser] = useState(currentUser);
+  const [route, setRoute] = useState(readRoute);
   const [useCode, setUseCode] = useState(false);
   const [code, setCode] = useState("");
   const [session, setSession] = useState(null);
   const [err, setErr] = useState("");
-  const sh = useShared(5000);
+
+  useEffect(() => {
+    const onPop = () => setRoute(readRoute());
+    window.addEventListener("popstate", onPop);
+    return () => window.removeEventListener("popstate", onPop);
+  }, []);
 
   // Sign-out (or an expired refresh token) anywhere returns to the login screen.
   useEffect(() => onAuthChange(() => {
@@ -3354,6 +3470,7 @@ export default function App() {
   };
 
   if (!user) return <Login onSignedIn={setUser} />;
+  if (route.gameId) return <GameEntry key={route.gameId} gameId={route.gameId} view={route.view} onLeave={() => openGame(null)} />;
   if (!session && !useCode) return <AccountHome user={user} onUseCode={() => setUseCode(true)} />;
   if (!session) {
     return (
@@ -3380,7 +3497,6 @@ export default function App() {
       </div>
     );
   }
-  if (session.kind === "projector") return <Projector sh={sh} />;
-  if (session.kind === "facilitator") return <Facilitator sh={sh} />;
-  return <TeamView team={session.team} sh={sh} observer={!!session.observer} />;
+  // Access-code path: shared state lives in the old storage Lambda (?s=).
+  return <GameRoom key="access-code" kind={session.kind} team={session.team} observer={session.observer} />;
 }
