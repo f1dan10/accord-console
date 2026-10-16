@@ -1,0 +1,14 @@
+{
+  "name": "accord-games",
+  "private": true,
+  "type": "module",
+  "main": "index.mjs",
+  "version": "1.0.0",
+  "scripts": {
+    "check": "node --test test.mjs"
+  },
+  "dependencies": {
+    "@aws-sdk/client-dynamodb": "^3.1152.0",
+    "@aws-sdk/lib-dynamodb": "^3.1152.0"
+  }
+}
