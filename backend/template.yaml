@@ -30,9 +30,15 @@ Resources:
         AllowOrigins: [!Ref AllowedOrigin]
         AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
         AllowHeaders: [content-type, authorization]
+      # Sized for several classes polling at once (~1 request / 5 s per browser).
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 20
-        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      # /ai is public and calls Bedrock, so it keeps the tight cap.
+      RouteSettings:
+        "POST /ai":
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
       # Opt-in per route (Auth: Authorizer: CognitoJwt); /ai stays public.
       Auth:
         Authorizers:
@@ -73,7 +79,8 @@ Resources:
       UserPoolId: !Ref UserPool
       ClientName: accord-web
       GenerateSecret: false
-      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      # USER_PASSWORD_AUTH (over TLS) lets backend/games/smoke.mjs sign in from a script.
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       PreventUserExistenceErrors: ENABLED
       IdTokenValidity: 1
       RefreshTokenValidity: 30
@@ -151,6 +158,89 @@ Resources:
         - { AttributeName: code, AttributeType: S }
       KeySchema:
         - { AttributeName: code, KeyType: HASH }
+
+  GamesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: games/
+      Handler: index.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          GAMES_TABLE: !Ref GamesTable
+          DOCS_TABLE: !Ref GameDocsTable
+          MEMBERS_TABLE: !Ref MembersTable
+          CODES_TABLE: !Ref CodesTable
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref GamesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref GameDocsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref MembersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CodesTable }
+      Events:
+        ListGames:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        CreateGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        JoinGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/join
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        GetGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        GetDoc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/doc
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        PutDoc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/doc
+            Method: PUT
+            Auth:
+              Authorizer: CognitoJwt
+        AssignDelegation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/assign
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        SetStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/status
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
 
   AiFunction:
     Type: AWS::Serverless::Function
