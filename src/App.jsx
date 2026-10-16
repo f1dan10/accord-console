@@ -625,7 +625,15 @@ async function sUpdate(key, fallback, mutate, verify) {
   return null;
 }
 
-const DEFAULT_CLOCK = { running: false, remainingMs: S.meta.deadlineMinutes * 60 * 1000, endsAt: null };
+/* Full clock for the open game: the scenario's deadline, unless the professor
+   chose another length when creating the game (setup.minutes). Reassigned by
+   setGameDeadline() before a game's room mounts; AI pacing and Reset follow it. */
+let DEFAULT_CLOCK = { running: false, remainingMs: S.meta.deadlineMinutes * 60 * 1000, endsAt: null };
+function setGameDeadline(minutes) {
+  const m = Number(minutes) > 0 ? Number(minutes) : S.meta.deadlineMinutes;
+  DEFAULT_CLOCK = { running: false, remainingMs: m * 60 * 1000, endsAt: null };
+}
+const deadlineMinutes = () => Math.round(DEFAULT_CLOCK.remainingMs / 60000);
 /* v1.5 — Draft ordering everywhere a list of drafts is shown: the draft closest to
    adoption first, the newest breaking ties. A badge says how far each is from adoption. */
 function orderDrafts(live, endo) {
@@ -982,7 +990,7 @@ function aiDecide(team, snapshot, now, mem) {
   const actions = [];
   if (flags.adoptedId || flags.collapsed) return actions;
   if (!clock.running) return actions;
-  const totalMs = S.meta.deadlineMinutes * 60 * 1000;
+  const totalMs = DEFAULT_CLOCK.remainingMs;
   const rem = remainingOf(clock, now);
   if (rem <= 0) return actions;
   const remFrac = rem / totalMs;
@@ -2088,7 +2096,7 @@ function Facilitator({ sh }) {
           <div>
       <h3 className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>CLOCK</h3>
       <div className="flex flex-wrap gap-2">
-        {[["Start", start], ["Pause", pause], ["+5 min", () => nudge(5)], ["−5 min", () => nudge(-5)], [`Reset ${S.meta.deadlineMinutes}:00`, () => clockSet(DEFAULT_CLOCK)]].map(([l, f]) => (
+        {[["Start", start], ["Pause", pause], ["+5 min", () => nudge(5)], ["−5 min", () => nudge(-5)], [`Reset ${deadlineMinutes()}:00`, () => clockSet(DEFAULT_CLOCK)]].map(([l, f]) => (
           <button key={l} onClick={() => act(l, f)} disabled={!!busy}
             className="px-3 py-2 rounded font-bold text-sm" style={{ background: CHARCOAL, color: PAPER }}>{l}</button>
         ))}
@@ -3314,9 +3322,177 @@ function Login({ onSignedIn }) {
   );
 }
 
-/* Signed-in landing page. The professor and student dashboards (game lists,
-   new game, join by code) replace the placeholder text; until then the
-   access-code gate stays reachable from here. */
+/* ============ PROFESSOR DASHBOARD ============
+   The professor's games with their status, New game, and the buttons that open
+   one (?game=<id>, see GameEntry). Starting or resuming flips the game to live
+   first, so students can join and write again. */
+const STATUS_CHIP = {
+  lobby: { label: "NOT STARTED", bg: "transparent", fg: GOLD, border: GOLD },
+  live: { label: "LIVE", bg: GREEN, fg: PAPER },
+  paused: { label: "PAUSED", bg: GOLD, fg: DEEP },
+  completed: { label: "COMPLETED", bg: "#3a3f40", fg: "#c9c4b8" },
+};
+const STATUS_ORDER = { live: 0, paused: 1, lobby: 2, completed: 3 };
+const CARD = { background: CHARCOAL, border: "1px solid #34393a" };
+const BTN_PRIMARY = { background: GOLD, color: DEEP, fontFamily: BODY_HI };
+const BTN_SECONDARY = { background: "transparent", color: PAPER, fontFamily: BODY_HI, border: "1px solid #5a6061" };
+
+function StatusChip({ status }) {
+  const c = STATUS_CHIP[status] || STATUS_CHIP.completed;
+  return (
+    <span className="text-xs px-2 py-1 rounded font-bold whitespace-nowrap"
+      style={{ background: c.bg, color: c.fg, border: `1px solid ${c.border || c.bg}`, fontFamily: MONO_FONT, letterSpacing: "0.06em" }}>
+      {c.label}
+    </span>
+  );
+}
+const shortDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "");
+const projectorUrl = (gameId) => `${location.pathname}?game=${encodeURIComponent(gameId)}&view=projector`;
+
+function NewGameForm({ onCreated, onCancel }) {
+  const [title, setTitle] = useState("");
+  const [minutes, setMinutes] = useState(String(S.meta.deadlineMinutes));
+  const [seats, setSeats] = useState(DEFAULT_AI);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
+
+  const create = async () => {
+    const t = title.trim();
+    const m = Math.round(Number(minutes));
+    if (!t) { setErr("Give the game a name, e.g. your course and section."); return; }
+    if (!(m >= 5 && m <= 300)) { setErr("The clock must be between 5 and 300 minutes."); return; }
+    setBusy(true); setErr("");
+    try {
+      const { game } = await api("POST", "/games", { title: t, setup: { minutes: m, seats } });
+      /* Seed the new game's state with the chosen seats and clock. If this
+         write fails the game still works: the clock follows setup.minutes
+         anyway, and seats can be switched in the console. */
+      const seed = { [K.ai]: seats, [K.clock]: { running: false, remainingMs: m * 60 * 1000, endsAt: null } };
+      await api("PUT", `/games/${game.gameId}/doc`, JSON.stringify(seed)).catch(() => {});
+      onCreated(game);
+    } catch (e) { setErr(e.message); setBusy(false); }
+  };
+
+  return (
+    <div className="rounded p-4 mb-6" style={CARD}>
+      <h3 className="font-bold mb-3" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>NEW GAME</h3>
+      <AuthField label="NAME (e.g. course and section)" value={title} maxLength={80} onChange={(e) => setTitle(e.target.value)} />
+      <AuthField label="CLOCK (minutes)" type="number" min={5} max={300} value={minutes} onChange={(e) => setMinutes(e.target.value)} />
+      <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>SEATS (you can switch these during play)</div>
+      <div className="grid gap-2 mb-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
+        {TEAMS.map((t) => (
+          <SeatToggle key={t} team={t} value={seats[t]} onToggle={() => setSeats((s) => ({ ...s, [t]: s[t] === "ai" ? "human" : "ai" }))} />
+        ))}
+      </div>
+      <div className="flex gap-2 flex-wrap">
+        <button onClick={create} disabled={busy} aria-busy={busy ? "true" : "false"} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>Create game</button>
+        <button onClick={onCancel} disabled={busy} className="px-4 py-2 rounded" style={BTN_SECONDARY}>Cancel</button>
+      </div>
+      {err && <div className="mt-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+    </div>
+  );
+}
+
+/* Shown right after creating a game: the join word, large enough to project. */
+function ShareCode({ game, onOpen, onDone }) {
+  return (
+    <div className="rounded p-6 mb-6 text-center" style={{ ...CARD, border: `1px solid ${GOLD}` }}>
+      <div className="text-xs pz-label mb-2" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.12em" }}>SHARE THIS CODE WITH YOUR CLASS</div>
+      <div className="font-bold mb-2" style={{ color: GOLD, fontFamily: MONO_FONT, fontSize: "clamp(2.4rem, 10vw, 4.5rem)", letterSpacing: "0.12em", lineHeight: 1.1, wordBreak: "break-all" }}>
+        {game.code.toUpperCase()}
+      </div>
+      <div className="text-sm mb-5" style={{ opacity: 0.8 }}>{game.title} · students sign in, choose <b>Join a game</b> and type this word.</div>
+      <div className="flex gap-2 justify-center flex-wrap">
+        <button onClick={onOpen} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>Start game</button>
+        <a href={projectorUrl(game.gameId)} target="_blank" rel="noreferrer" className="px-4 py-2 rounded" style={{ ...BTN_SECONDARY, textDecoration: "none" }}>Open projector</a>
+        <button onClick={onDone} className="px-4 py-2 rounded" style={BTN_SECONDARY}>Back to games</button>
+      </div>
+    </div>
+  );
+}
+
+function ProfessorGames() {
+  const [games, setGames] = useState(null);
+  const [err, setErr] = useState("");
+  const [opening, setOpening] = useState("");
+  const [creating, setCreating] = useState(false);
+  const [created, setCreated] = useState(null);
+
+  const load = useCallback(async () => {
+    try {
+      const { games: list } = await api("GET", "/games");
+      setGames(list
+        .filter((g) => g.membership.role === "professor")
+        .sort((a, b) => (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || (b.updatedAt || "").localeCompare(a.updatedAt || "")));
+      setErr("");
+    } catch (e) { setErr(e.message); }
+  }, []);
+  useEffect(() => {
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, [load]);
+
+  // Starting (lobby) or resuming (paused) makes the game live, then opens the console.
+  const open = async (g) => {
+    setOpening(g.gameId); setErr("");
+    try {
+      if (g.status === "lobby" || g.status === "paused") await api("POST", `/games/${g.gameId}/status`, { status: "live" });
+      openGame(g.gameId);
+    } catch (e) { setErr(e.message); setOpening(""); load(); }
+  };
+
+  const actions = {
+    lobby: [["Start game", true]],
+    live: [["Open console", true], ["Projector", false]],
+    paused: [["Resume", true]],
+    completed: [["View results", true]],
+  };
+
+  return (
+    <>
+      <div className="flex items-center justify-between gap-3 mt-6 mb-4 flex-wrap">
+        <h2 className="text-xl font-bold" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
+        {!creating && !created && (
+          <button onClick={() => setCreating(true)} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>+ New game</button>
+        )}
+      </div>
+      {creating && <NewGameForm onCancel={() => setCreating(false)} onCreated={(g) => { setCreating(false); setCreated(g); load(); }} />}
+      {created && <ShareCode game={created} onOpen={() => open(created)} onDone={() => setCreated(null)} />}
+      {err && <div className="mb-4 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+      {games === null && !err && <div className="text-sm" style={{ opacity: 0.7 }}>Loading your games…</div>}
+      {games && games.length === 0 && !creating && !created && (
+        <div className="text-sm" style={{ opacity: 0.75 }}>No games yet. Choose <b>New game</b> to set one up and get a code for your class.</div>
+      )}
+      <div className="flex flex-col gap-3">
+        {(games || []).map((g) => (
+          <div key={g.gameId} className="rounded p-4 flex items-center gap-3 flex-wrap" style={CARD}>
+            <div className="flex-1" style={{ minWidth: 200 }}>
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <span className="font-bold" style={{ fontFamily: BODY_HI }}>{g.title}</span>
+                <StatusChip status={g.status} />
+              </div>
+              <div className="text-xs" style={{ opacity: 0.7, fontFamily: MONO_FONT }}>
+                {g.status !== "completed" && <>CODE <span style={{ color: GOLD }}>{g.code.toUpperCase()}</span> · </>}
+                created {shortDate(g.createdAt)}{g.updatedAt !== g.createdAt && <> · updated {shortDate(g.updatedAt)}</>}
+              </div>
+            </div>
+            <div className="flex gap-2 flex-wrap">
+              {(actions[g.status] || []).map(([label, primary]) => primary
+                ? <button key={label} onClick={() => open(g)} disabled={!!opening} aria-busy={opening === g.gameId ? "true" : "false"}
+                    className="px-4 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>{label}</button>
+                : <a key={label} href={projectorUrl(g.gameId)} target="_blank" rel="noreferrer"
+                    className="px-4 py-2 rounded text-sm" style={{ ...BTN_SECONDARY, textDecoration: "none" }}>{label}</a>)}
+            </div>
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* Signed-in landing page: the professor dashboard, or (until the student
+   dashboard lands) a placeholder. The access-code gate stays reachable. */
 function AccountHome({ user, onUseCode }) {
   const prof = user.role === "professor";
   return (
@@ -3333,15 +3509,13 @@ function AccountHome({ user, onUseCode }) {
           </div>
         </div>
         <GoldRule />
-        <h2 className="text-xl font-bold mt-6 mb-2" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
-        <div className="text-sm mb-6" style={{ opacity: 0.75 }}>
-          {prof
-            ? "Starting, pausing and resuming games from your account is coming soon."
-            : "Joining a game with your professor's word code is coming soon."}
+        {prof ? <ProfessorGames /> : <>
+          <h2 className="text-xl font-bold mt-6 mb-2" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
+          <div className="text-sm mb-6" style={{ opacity: 0.75 }}>Joining a game with your professor's word code is coming soon.</div>
+        </>}
+        <div className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a", opacity: 0.8 }}>
+          Using a delegation access code instead? <button onClick={onUseCode} style={AUTH_LINK}>Enter with an access code</button>
         </div>
-        <button onClick={onUseCode} className="px-4 py-3 rounded font-bold" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI, border: `1px solid ${GOLD}` }}>
-          Enter with an access code
-        </button>
       </div>
     </div>
   );
@@ -3393,6 +3567,7 @@ function GameEntry({ gameId, view, onLeave }) {
         else wait = `Your delegation "${membership.delegation}" isn't part of this scenario. Ask your professor to reassign you.`;
         if (room) {
           if (getActiveGame() !== gameId) { setActiveGame(gameId); resetDocState(); }
+          setGameDeadline(game.setup?.minutes);
           setState({ phase: "room", room, game });
         } else {
           setState({ phase: "wait", message: wait, game });
@@ -3407,7 +3582,7 @@ function GameEntry({ gameId, view, onLeave }) {
   }, [gameId, view]);
 
   // Leaving the game (or switching to another) detaches storage from it.
-  useEffect(() => () => { setActiveGame(null); resetDocState(); }, [gameId]);
+  useEffect(() => () => { setActiveGame(null); resetDocState(); setGameDeadline(null); }, [gameId]);
 
   if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
   if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;
