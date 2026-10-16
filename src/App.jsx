@@ -1,4 +1,8 @@
 import React, { useState, useEffect, useCallback } from "react";
+import {
+  authConfigured, currentUser, onAuthChange, signIn, signUp, signOut,
+  confirmSignUp, resendCode, forgotPassword, resetPassword,
+} from "./auth.js";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -3171,12 +3175,167 @@ function TeamView({ team, sh, observer }) {
 }
 
 /* ================= GATE ================= */
+/* ============ ACCOUNTS ============
+   Sign in / sign up against the Cognito user pool (src/auth.js). The role on
+   the token (professor | student) comes from the backend's allow-list. */
+const AUTH_INPUT = { background: CHARCOAL, color: PAPER, border: "1px solid #4a4f50", fontFamily: BODY_HI };
+const AUTH_LINK = { color: GOLD, fontFamily: BODY_HI, background: "none", border: 0, padding: 0, cursor: "pointer", textDecoration: "underline" };
+
+function AuthField({ label, ...props }) {
+  return (
+    <label className="block text-left mb-3">
+      <span className="block text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>{label}</span>
+      <input {...props} required className="w-full px-3 py-3 rounded" style={AUTH_INPUT} />
+    </label>
+  );
+}
+
+const AUTH_TITLES = {
+  signin: "Sign in", signup: "Create your account", confirm: "Confirm your email",
+  forgot: "Reset your password", reset: "Choose a new password",
+};
+
+function Login({ onSignedIn }) {
+  const [mode, setMode] = useState("signin");
+  const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
+  const [name, setName] = useState("");
+  const [code, setCode] = useState("");
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState(authConfigured ? "" : "Sign-in isn't configured for this build (VITE_COGNITO_* missing).");
+  const [info, setInfo] = useState("");
+
+  const go = (m, msg = "") => { setMode(m); setErr(""); setInfo(msg); setCode(""); };
+  const run = async (fn) => {
+    setBusy(true); setErr("");
+    try { await fn(); }
+    catch (e) {
+      if (e.code === "UserNotConfirmedException") {
+        resendCode(email).catch(() => {});
+        go("confirm", `Your email isn't confirmed yet. We sent a new code to ${email.trim()}.`);
+      } else setErr(e.message || "Something went wrong.");
+    } finally { setBusy(false); }
+  };
+  const passwordOk = () => {
+    if (password.length >= 8 && /\d/.test(password)) return true;
+    setErr("Use at least 8 characters, including a number."); return false;
+  };
+
+  const submit = (e) => {
+    e.preventDefault();
+    if (mode === "signin") run(async () => onSignedIn(await signIn(email, password)));
+    if (mode === "signup" && passwordOk()) run(async () => {
+      await signUp({ email, password, name });
+      go("confirm", `We sent a 6-digit code to ${email.trim()}.`);
+    });
+    if (mode === "confirm") run(async () => {
+      await confirmSignUp(email, code);
+      if (password) onSignedIn(await signIn(email, password));
+      else go("signin", "Email confirmed. Sign in to continue.");
+    });
+    if (mode === "forgot") run(async () => {
+      await forgotPassword(email);
+      go("reset", `If an account exists for ${email.trim()}, we sent it a reset code.`);
+    });
+    if (mode === "reset" && passwordOk()) run(async () => {
+      await resetPassword(email, code, password);
+      onSignedIn(await signIn(email, password));
+    });
+  };
+
+  const emailField = <AuthField label="EMAIL" type="email" autoComplete="email" value={email} onChange={(e) => setEmail(e.target.value)} />;
+  const codeField = <AuthField label="CODE FROM YOUR EMAIL" inputMode="numeric" autoComplete="one-time-code" value={code} onChange={(e) => setCode(e.target.value)} />;
+  const passwordField = (isNew) => (
+    <AuthField label={isNew ? (mode === "reset" ? "NEW PASSWORD" : "PASSWORD (8+ characters, with a number)") : "PASSWORD"}
+      type="password" autoComplete={isNew ? "new-password" : "current-password"} value={password} onChange={(e) => setPassword(e.target.value)} />
+  );
+
+  return (
+    <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
+      <form onSubmit={submit} className="w-full max-w-sm text-center">
+        <div className="mb-3"><Wordmark light h="44px" /></div>
+        <div className="text-xs tracking-widest pz-label mb-8" style={{ color: GOLD, fontFamily: MONO_FONT }}>{S.meta.gateTagline}</div>
+        <h1 className="text-lg font-bold mb-4" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>{AUTH_TITLES[mode].toUpperCase()}</h1>
+        {info && <div className="mb-4 text-sm" style={{ color: PAPER, opacity: 0.85 }}>{info}</div>}
+
+        {mode === "signup" && <AuthField label="FULL NAME" autoComplete="name" value={name} onChange={(e) => setName(e.target.value)} />}
+        {(mode === "signin" || mode === "signup" || mode === "forgot") && emailField}
+        {(mode === "confirm" || mode === "reset") && codeField}
+        {mode === "signin" && passwordField(false)}
+        {(mode === "signup" || mode === "reset") && passwordField(true)}
+
+        <button type="submit" disabled={busy || !authConfigured} aria-busy={busy ? "true" : "false"}
+          className="w-full py-3 rounded font-bold mt-1" style={{ background: GOLD, color: DEEP, fontFamily: BODY_HI }}>
+          {{ signin: "Sign in", signup: "Create account", confirm: "Confirm", forgot: "Send reset code", reset: "Set password and sign in" }[mode]}
+        </button>
+        {err && <div className="mt-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+
+        <div className="mt-6 text-sm flex flex-col gap-2 items-center" style={{ color: PAPER }}>
+          {mode === "signin" && <>
+            <span>New here? <button type="button" style={AUTH_LINK} onClick={() => go("signup")}>Create an account</button></span>
+            <button type="button" style={AUTH_LINK} onClick={() => go("forgot")}>Forgot your password?</button>
+          </>}
+          {mode === "signup" && <span>Already have an account? <button type="button" style={AUTH_LINK} onClick={() => go("signin")}>Sign in</button></span>}
+          {mode === "confirm" && <>
+            <button type="button" style={AUTH_LINK} disabled={busy}
+              onClick={() => run(async () => { await resendCode(email); setInfo(`We sent a new code to ${email.trim()}.`); })}>Send a new code</button>
+            <button type="button" style={AUTH_LINK} onClick={() => go("signin")}>Back to sign in</button>
+          </>}
+          {(mode === "forgot" || mode === "reset") && <button type="button" style={AUTH_LINK} onClick={() => go("signin")}>Back to sign in</button>}
+        </div>
+      </form>
+    </div>
+  );
+}
+
+/* Signed-in landing page. The professor and student dashboards (game lists,
+   new game, join by code) replace the placeholder text; until then the
+   access-code gate stays reachable from here. */
+function AccountHome({ user, onUseCode }) {
+  const prof = user.role === "professor";
+  return (
+    <div className="min-h-screen p-6" style={{ background: DEEP, color: PAPER, fontFamily: BODY_FONT, textAlign: "left" }}>
+      <div className="max-w-2xl mx-auto">
+        <div className="flex items-center justify-between flex-wrap gap-3 mb-3">
+          <Wordmark light h="28px" />
+          <div className="flex items-center gap-3 text-sm flex-wrap">
+            <span style={{ fontFamily: BODY_HI }}>{user.name}</span>
+            <span className="text-xs px-2 py-1 rounded font-bold" style={{ background: prof ? GOLD : CHARCOAL, color: prof ? DEEP : PAPER, fontFamily: MONO_FONT }}>
+              {prof ? "PROFESSOR" : "STUDENT"}
+            </span>
+            <button onClick={signOut} style={AUTH_LINK}>Sign out</button>
+          </div>
+        </div>
+        <GoldRule />
+        <h2 className="text-xl font-bold mt-6 mb-2" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
+        <div className="text-sm mb-6" style={{ opacity: 0.75 }}>
+          {prof
+            ? "Starting, pausing and resuming games from your account is coming soon."
+            : "Joining a game with your professor's word code is coming soon."}
+        </div>
+        <button onClick={onUseCode} className="px-4 py-3 rounded font-bold" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI, border: `1px solid ${GOLD}` }}>
+          Enter with an access code
+        </button>
+      </div>
+    </div>
+  );
+}
+
 export default function App() {
   useFontEmbed();
+  const [user, setUser] = useState(currentUser);
+  const [useCode, setUseCode] = useState(false);
   const [code, setCode] = useState("");
   const [session, setSession] = useState(null);
   const [err, setErr] = useState("");
   const sh = useShared(5000);
+
+  // Sign-out (or an expired refresh token) anywhere returns to the login screen.
+  useEffect(() => onAuthChange(() => {
+    const u = currentUser();
+    setUser(u);
+    if (!u) { setSession(null); setUseCode(false); }
+  }), []);
 
   const enter = async () => {
     ensureAudio();
@@ -3194,6 +3353,8 @@ export default function App() {
     setSession(hit); setErr("");
   };
 
+  if (!user) return <Login onSignedIn={setUser} />;
+  if (!session && !useCode) return <AccountHome user={user} onUseCode={() => setUseCode(true)} />;
   if (!session) {
     return (
       <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
@@ -3211,6 +3372,7 @@ export default function App() {
             Enter the conference
           </button>
           {err && <div className="mt-3 text-sm" style={{ color: "#ff8a70" }}>{err}</div>}
+          <button onClick={() => { setUseCode(false); setErr(""); }} className="mt-4 text-sm" style={AUTH_LINK}>Back to your account</button>
           <div className="mt-8 text-xs opacity-40" style={{ color: PAPER }}>
             All submissions are shared with the conference system. Preference data stays on your screen.
           </div>

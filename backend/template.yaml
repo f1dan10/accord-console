@@ -79,7 +79,7 @@ Resources:
       UserPoolId: !Ref UserPool
       ClientName: accord-web
       GenerateSecret: false
-      # USER_PASSWORD_AUTH (over TLS) lets backend/games/smoke.mjs sign in from a script.
+      # USER_PASSWORD_AUTH (over TLS) is what src/auth.js and backend/games/smoke.mjs use.
       ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
       PreventUserExistenceErrors: ENABLED
       IdTokenValidity: 1
