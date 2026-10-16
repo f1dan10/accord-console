@@ -1587,7 +1587,124 @@ function MoodPanel({ moodKey }) {
 }
 
 /* ================= FACILITATOR ================= */
-function Facilitator({ sh }) {
+/* ============ PLAYERS (account games) ============
+   Join code, the students who joined, and their delegation. Polls the games
+   API; assigning a seat lets a waiting student in within a few seconds. */
+const OBSERVER = "observer";
+function PlayersPanel({ game, aiCtl }) {
+  const [members, setMembers] = useState(null);
+  const [pendingSeat, setPendingSeat] = useState({}); // userId -> delegation being saved
+  const [err, setErr] = useState("");
+  const [spreading, setSpreading] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const r = await api("GET", `/games/${encodeURIComponent(game.gameId)}`);
+      setMembers((r.members || []).filter((m) => m.userId !== game.ownerId)
+        .sort((a, b) => (a.joinedAt || "").localeCompare(b.joinedAt || "")));
+    } catch (e) { setErr(e.message); }
+  }, [game.gameId, game.ownerId]);
+  useEffect(() => {
+    load();
+    const t = setInterval(load, 5000);
+    return () => clearInterval(t);
+  }, [load]);
+
+  const assign = async (userId, delegation) => {
+    setPendingSeat((p) => ({ ...p, [userId]: delegation })); setErr("");
+    try {
+      const { member } = await api("POST", `/games/${encodeURIComponent(game.gameId)}/assign`, { userId, delegation });
+      setMembers((ms) => ms.map((m) => (m.userId === userId ? { ...m, delegation: member.delegation } : m)));
+    } catch (e) { setErr(e.message); }
+    setPendingSeat((p) => { const n = { ...p }; delete n[userId]; return n; });
+  };
+
+  const list = members || [];
+  const seatOf = (m) => (m.userId in pendingSeat ? pendingSeat[m.userId] : m.delegation);
+  const waiting = list.filter((m) => !seatOf(m));
+  const countIn = (t) => list.filter((m) => seatOf(m) === t).length;
+  const humanSeats = TEAMS.filter((t) => aiCtl[t] !== "ai");
+
+  // Waiting students go one by one to the human-played delegation with the fewest players.
+  const spread = async () => {
+    if (!humanSeats.length) { setErr("Every delegation is AI-played. Switch a seat to Human first."); return; }
+    setSpreading(true);
+    const counts = Object.fromEntries(humanSeats.map((t) => [t, countIn(t)]));
+    for (const m of waiting) {
+      const t = humanSeats.reduce((a, b) => (counts[b] < counts[a] ? b : a));
+      counts[t] += 1;
+      await assign(m.userId, t);
+    }
+    setSpreading(false);
+  };
+
+  return (
+    <div className="mt-3 p-4 rounded" style={{ background: PLATE, textAlign: "left" }}>
+      <div className="flex flex-wrap items-center gap-x-6 gap-y-2 mb-3">
+        <h3 className="font-bold tracking-wide" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>
+          PLAYERS <span className="font-normal text-xs opacity-60">{game.title}</span>
+        </h3>
+        <div className="flex items-center gap-2">
+          <span className="text-xs pz-label" style={{ opacity: 0.7 }}>JOIN CODE</span>
+          <span className="px-3 py-1 rounded font-bold text-xl" style={{ background: CHARCOAL, color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.12em" }}>
+            {game.code.toUpperCase()}
+          </span>
+        </div>
+        <div className="text-sm" style={{ marginLeft: "auto" }}>
+          {members === null ? "Loading players…" : `${list.length} joined`}
+          {waiting.length > 0 && <span className="ml-2 px-2 py-0.5 rounded text-xs font-bold" style={{ background: RED, color: PAPER }}>{waiting.length} waiting for a delegation</span>}
+        </div>
+      </div>
+
+      <div className="flex flex-wrap gap-2 mb-3">
+        {TEAMS.map((t) => {
+          const n = countIn(t), ai = aiCtl[t] === "ai";
+          return (
+            <span key={t} className="text-xs px-2 py-1 rounded" style={{ background: "white", fontFamily: MONO_FONT, color: !ai && n === 0 ? RED : CHARCOAL }}>
+              {FLAGS[t]} {t} · {n} {ai ? "· AI seat" : n === 0 ? "· nobody yet" : ""}
+            </span>
+          );
+        })}
+        <span className="text-xs px-2 py-1 rounded" style={{ background: "white", fontFamily: MONO_FONT }}>Observers · {countIn(OBSERVER)}</span>
+        {waiting.length > 0 && (
+          <button onClick={spread} disabled={spreading} aria-busy={spreading ? "true" : "false"}
+            className="px-3 py-1 rounded font-bold text-xs" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>
+            Spread waiting students across human delegations
+          </button>
+        )}
+      </div>
+
+      {members && list.length === 0 && (
+        <div className="text-sm" style={{ opacity: 0.75 }}>No students yet. They sign in, choose <b>Join a game</b> and type <b>{game.code.toUpperCase()}</b>.</div>
+      )}
+      {list.length > 0 && (
+        <div className="grid gap-1.5" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(280px, 1fr))" }}>
+          {list.map((m) => {
+            const seat = seatOf(m);
+            return (
+              <div key={m.userId} className="flex items-center gap-2 px-2.5 py-1.5 rounded" style={{ background: "white", border: seat ? "1px solid transparent" : `1px solid ${RED}` }}>
+                <div className="flex-1 min-w-0">
+                  <div className="text-sm font-bold truncate" style={{ fontFamily: BODY_HI }}>{m.name}</div>
+                  <div className="text-xs truncate" style={{ opacity: 0.6 }}>{m.email}</div>
+                </div>
+                <select value={seat || ""} disabled={m.userId in pendingSeat} aria-label={`Delegation for ${m.name}`}
+                  onChange={(e) => assign(m.userId, e.target.value || null)}
+                  className="text-sm px-2 py-1 rounded" style={{ background: PAPER, color: CHARCOAL, border: "1px solid #c9c4b8", maxWidth: 170 }}>
+                  <option value="">— Unassigned —</option>
+                  {TEAMS.map((t) => <option key={t} value={t}>{FLAGS[t]} {DELEG[t].name}{aiCtl[t] === "ai" ? " (AI seat)" : ""}</option>)}
+                  <option value={OBSERVER}>Observer (projector view)</option>
+                </select>
+              </div>
+            );
+          })}
+        </div>
+      )}
+      {err && <div className="mt-2 text-sm font-bold" role="alert" style={{ color: RED }}>{err}</div>}
+    </div>
+  );
+}
+
+function Facilitator({ sh, game }) {
   const { clock, props, endo, injects, flags, pub, comms, pull, aiCtl } = sh;
   const [now, setNow] = useState(Date.now());
   /* ---- AI seat host: this console runs every seat toggled to AI ---- */
@@ -2082,6 +2199,7 @@ function Facilitator({ sh }) {
         </div>
       </div>
       <GoldRule />
+      {game && <PlayersPanel game={game} aiCtl={{ ...aiCtl, ...seatLocal }} />}
 
       {/* v1.5 — COMMAND PANEL: everything the GM touches during play, above the fold */}
       <div className="mt-3 p-4 rounded" style={{ background: PLATE }}>
@@ -3523,10 +3641,10 @@ function AccountHome({ user, onUseCode }) {
 
 /* One mounted game. Keyed by game id by its parent, so polling, timers and
    the AI host all start fresh when a different game is opened. */
-function GameRoom({ kind, team, observer }) {
+function GameRoom({ kind, team, observer, game }) {
   const sh = useShared(5000);
   if (kind === "projector") return <Projector sh={sh} />;
-  if (kind === "facilitator") return <Facilitator sh={sh} />;
+  if (kind === "facilitator") return <Facilitator sh={sh} game={game} />;
   return <TeamView team={team} sh={sh} observer={!!observer} />;
 }
 
@@ -3552,7 +3670,7 @@ function GameEntry({ gameId, view, onLeave }) {
   const [state, setState] = useState({ phase: "loading" });
 
   useEffect(() => {
-    let alive = true, timer = null;
+    let alive = true, timer = null, inRoom = false;
     const load = async () => {
       try {
         const { game, membership } = await api("GET", `/games/${encodeURIComponent(gameId)}`);
@@ -3565,16 +3683,23 @@ function GameEntry({ gameId, view, onLeave }) {
         else if (membership.delegation === "observer") room = { kind: "projector" };
         else if (TEAMS.includes(membership.delegation)) room = { kind: "team", team: membership.delegation };
         else wait = `Your delegation "${membership.delegation}" isn't part of this scenario. Ask your professor to reassign you.`;
+        inRoom = !!room;
         if (room) {
           if (getActiveGame() !== gameId) { setActiveGame(gameId); resetDocState(); }
           setGameDeadline(game.setup?.minutes);
-          setState({ phase: "room", room, game });
+          // Same seat as before: keep the mounted room (no remount, no lost drafts).
+          setState((prev) => (prev.phase === "room" && prev.room.kind === room.kind && prev.room.team === room.team ? prev : { phase: "room", room, game }));
+          // Students keep following their seat: reassigned, made observer, or unassigned.
+          if (!owner) timer = setTimeout(load, 10000);
         } else {
           setState({ phase: "wait", message: wait, game });
           timer = setTimeout(load, 5000);
         }
       } catch (e) {
-        if (alive) setState({ phase: "error", message: e.message });
+        if (!alive) return;
+        // A blip while already playing shouldn't throw the student out; try again.
+        if (inRoom && e.status !== 404) { timer = setTimeout(load, 10000); return; }
+        setState({ phase: "error", message: e.message });
       }
     };
     load();
@@ -3587,7 +3712,7 @@ function GameEntry({ gameId, view, onLeave }) {
   if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
   if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;
   if (state.phase === "wait") return <GameMessage title={state.game.title} message={state.message} onLeave={onLeave} />;
-  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}`} {...state.room} />;
+  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}`} {...state.room} game={state.game} />;
 }
 
 /* ?game=<id>[&view=projector] in the address bar is the open game, so a
