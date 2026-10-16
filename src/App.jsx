@@ -3609,8 +3609,89 @@ function ProfessorGames() {
   );
 }
 
-/* Signed-in landing page: the professor dashboard, or (until the student
-   dashboard lands) a placeholder. The access-code gate stays reachable. */
+/* ============ STUDENT DASHBOARD ============
+   Join a game with the professor's word, and the games played so far. Only
+   the professor resumes a paused game, so a paused game has no button here. */
+const seatLabel = (d) => (!d ? "Not assigned yet" : d === "observer" ? "Observer" : DELEG[d] ? `${FLAGS[d]} ${DELEG[d].name}` : d);
+
+function StudentGames() {
+  const [games, setGames] = useState(null);
+  const [err, setErr] = useState("");
+  const [word, setWord] = useState("");
+  const [joinErr, setJoinErr] = useState("");
+  const [joining, setJoining] = useState(false);
+
+  const load = useCallback(async () => {
+    try {
+      const { games: list } = await api("GET", "/games");
+      setGames(list
+        .filter((g) => g.membership.role === "student")
+        .sort((a, b) => (STATUS_ORDER[a.status] - STATUS_ORDER[b.status]) || (b.updatedAt || "").localeCompare(a.updatedAt || "")));
+      setErr("");
+    } catch (e) { setErr(e.message); }
+  }, []);
+  useEffect(() => {
+    load();
+    window.addEventListener("focus", load);
+    return () => window.removeEventListener("focus", load);
+  }, [load]);
+
+  const join = async (e) => {
+    e.preventDefault();
+    const code = word.trim();
+    if (!code) { setJoinErr("Type the word your professor shared."); return; }
+    setJoining(true); setJoinErr("");
+    try {
+      const { game } = await api("POST", "/games/join", { code });
+      openGame(game.gameId);
+    } catch (e2) { setJoinErr(e2.message); setJoining(false); load(); }
+  };
+
+  return (
+    <>
+      <form onSubmit={join} className="rounded p-4 mt-6 mb-6" style={CARD}>
+        <h2 className="text-xl font-bold mb-3" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>JOIN A GAME</h2>
+        <div className="flex gap-2 flex-wrap">
+          <input value={word} onChange={(e) => setWord(e.target.value)} placeholder="e.g. southern"
+            aria-label="Game code" autoCapitalize="none" autoCorrect="off" spellCheck={false}
+            className="flex-1 px-3 py-3 rounded text-lg font-bold" style={{ ...AUTH_INPUT, color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em", minWidth: 200 }} />
+          <button type="submit" disabled={joining} aria-busy={joining ? "true" : "false"} className="px-5 py-3 rounded font-bold" style={BTN_PRIMARY}>Join</button>
+        </div>
+        {joinErr && <div className="mt-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{joinErr}</div>}
+      </form>
+
+      <h2 className="text-xl font-bold mb-4" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
+      {err && <div className="mb-4 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+      {games === null && !err && <div className="text-sm" style={{ opacity: 0.7 }}>Loading your games…</div>}
+      {games && games.length === 0 && <div className="text-sm" style={{ opacity: 0.75 }}>Games you join will be listed here.</div>}
+      <div className="flex flex-col gap-3">
+        {(games || []).map((g) => (
+          <div key={g.gameId} className="rounded p-4 flex items-center gap-3 flex-wrap" style={CARD}>
+            <div className="flex-1" style={{ minWidth: 200 }}>
+              <div className="flex items-center gap-2 flex-wrap mb-1">
+                <span className="font-bold" style={{ fontFamily: BODY_HI }}>{g.title}</span>
+                <StatusChip status={g.status} />
+              </div>
+              <div className="text-xs" style={{ opacity: 0.7, fontFamily: MONO_FONT }}>
+                {g.ownerName} · {seatLabel(g.membership.delegation)} · joined {shortDate(g.membership.joinedAt)}
+              </div>
+            </div>
+            {(g.status === "live" || g.status === "lobby") && (
+              <button onClick={() => openGame(g.gameId)} className="px-4 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>Enter</button>
+            )}
+            {g.status === "paused" && <span className="text-sm" style={{ opacity: 0.75 }}>Your professor will resume it.</span>}
+            {g.status === "completed" && (
+              <button onClick={() => openGame(g.gameId)} className="px-4 py-2 rounded text-sm" style={BTN_SECONDARY}>View results</button>
+            )}
+          </div>
+        ))}
+      </div>
+    </>
+  );
+}
+
+/* Signed-in landing page: the professor or student dashboard. The
+   access-code gate stays reachable. */
 function AccountHome({ user, onUseCode }) {
   const prof = user.role === "professor";
   return (
@@ -3627,10 +3708,7 @@ function AccountHome({ user, onUseCode }) {
           </div>
         </div>
         <GoldRule />
-        {prof ? <ProfessorGames /> : <>
-          <h2 className="text-xl font-bold mt-6 mb-2" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>YOUR GAMES</h2>
-          <div className="text-sm mb-6" style={{ opacity: 0.75 }}>Joining a game with your professor's word code is coming soon.</div>
-        </>}
+        {prof ? <ProfessorGames /> : <StudentGames />}
         <div className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a", opacity: 0.8 }}>
           Using a delegation access code instead? <button onClick={onUseCode} style={AUTH_LINK}>Enter with an access code</button>
         </div>
@@ -3679,16 +3757,20 @@ function GameEntry({ gameId, view, onLeave }) {
         let room = null, wait = null;
         if (owner) room = { kind: view === "projector" ? "projector" : "facilitator" };
         else if (game.status === "paused") wait = "This game is paused. Your professor will resume it.";
-        else if (!membership.delegation) wait = "You're in. Waiting for your professor to assign your delegation.";
+        else if (!membership.delegation) wait = game.status === "completed"
+          ? "This game has ended. You weren't assigned a delegation, so there are no results to show."
+          : "You're in. Waiting for your professor to assign your delegation.";
         else if (membership.delegation === "observer") room = { kind: "projector" };
-        else if (TEAMS.includes(membership.delegation)) room = { kind: "team", team: membership.delegation };
+        // A finished game opens read-only: the delegation's screen in observer mode.
+        else if (TEAMS.includes(membership.delegation)) room = { kind: "team", team: membership.delegation, observer: game.status === "completed" };
         else wait = `Your delegation "${membership.delegation}" isn't part of this scenario. Ask your professor to reassign you.`;
         inRoom = !!room;
         if (room) {
           if (getActiveGame() !== gameId) { setActiveGame(gameId); resetDocState(); }
           setGameDeadline(game.setup?.minutes);
           // Same seat as before: keep the mounted room (no remount, no lost drafts).
-          setState((prev) => (prev.phase === "room" && prev.room.kind === room.kind && prev.room.team === room.team ? prev : { phase: "room", room, game }));
+          setState((prev) => (prev.phase === "room" && prev.room.kind === room.kind && prev.room.team === room.team && !!prev.room.observer === !!room.observer
+            ? prev : { phase: "room", room, game }));
           // Students keep following their seat: reassigned, made observer, or unassigned.
           if (!owner) timer = setTimeout(load, 10000);
         } else {
@@ -3712,7 +3794,7 @@ function GameEntry({ gameId, view, onLeave }) {
   if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
   if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;
   if (state.phase === "wait") return <GameMessage title={state.game.title} message={state.message} onLeave={onLeave} />;
-  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}`} {...state.room} game={state.game} />;
+  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}:${state.room.observer ? "ro" : "rw"}`} {...state.room} game={state.game} />;
 }
 
 /* ?game=<id>[&view=projector] in the address bar is the open game, so a
