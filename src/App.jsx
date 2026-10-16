@@ -25,7 +25,7 @@ import { setActiveGame, getActiveGame } from "./storage.js";
    v1.5 — Brown / MIT build (Sep 2026). New, each switchable by cartridge:
      · Session pause / resume: locks team consoles, suspends clock and press
        window, resumes with the same remaining time (multi-session play).
-     · Restore from JSON export (GM console). Lands paused.
+     · Start a new game from a JSON export (professor dashboard). Lands paused.
      · Priority issue per delegation (cartridge `priority`, scoring.priorityWeight).
      · Per-delegation no-deal value (cartridge `noDealPct`) replaces
        universal collapse-to-zero.
@@ -189,38 +189,21 @@ const DELEG = Object.fromEntries(S.delegations.map((d) => [d.id, d]));
 const FLAGS = Object.fromEntries(S.delegations.map((d) => [d.id, d.flag]));
 const MEDIATORS = TEAMS.filter((t) => DELEG[t].mediator);
 const MINISTRY = Object.fromEntries(S.delegations.map((d) => [d.id, d.ministry]));
-/* v1.5 — Access codes. A published build carries only salted SHA-256 hashes of
-   the codes (cartridge accessHash / facilitatorHash / projectorHash), never the
-   codes themselves, so reading the source does not reveal them. Plain codes
-   are still honoured when present (authoring builds). Observer codes exist
-   only where the cartridge supplies one; they are no longer auto-derived. */
+/* Sign-in is by account (auth.js); delegation access codes in older cartridges
+   (access / accessHash / viewAccess / facilitatorCode / projectorCode …) are
+   ignored. The designer key is still checked against its salted SHA-256 hash,
+   so reading the source does not reveal it. */
 const CODE_SALT = "pyrsis-accord-1";
 async function codeHash(s) {
   const b = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(CODE_SALT + s.trim().toUpperCase()));
   return [...new Uint8Array(b)].map((x) => x.toString(16).padStart(2, "0")).join("");
 }
-const ACCESS_HASHED = {
-  ...Object.fromEntries(S.delegations.filter((d) => d.accessHash).map((d) => [d.accessHash, { kind: "team", team: d.id }])),
-  ...Object.fromEntries(S.delegations.filter((d) => d.viewHash).map((d) => [d.viewHash, { kind: "team", team: d.id, observer: true }])),
-  ...(S.facilitatorHash ? { [S.facilitatorHash]: { kind: "facilitator" } } : {}),
-  ...(S.projectorHash ? { [S.projectorHash]: { kind: "projector" } } : {}),
-};
-/* Designer view: scoring detail is shown only on the account that has entered
-   the designer key once. The flag lives in that account's personal storage. */
+/* Designer view: scoring detail is shown only in a browser where the designer
+   key was entered once (professor dashboard, Settings). The flag is per browser. */
 const DESIGNER_HASH = S.designerHash || null;
 async function readDesigner() {
   try { const r = await window.storage.get("pz-designer", false); return !!(r && r.value === "1"); } catch { return false; }
 }
-const ACCESS = {
-  ...Object.fromEntries(S.delegations.filter((d) => d.access).map((d) => [d.access.toUpperCase(), { kind: "team", team: d.id }])),
-  /* Observer codes: read-only team access, safe to share with a whole
-     class. One per delegation — config `viewAccess`, or auto-derived
-     as `<ID>-VIEW`. Observers see everything their delegation sees
-     (wire, drafts, worth-to-you, calculator) but cannot act. */
-  ...Object.fromEntries(S.delegations.filter((d) => d.viewAccess).map((d) => [d.viewAccess.toUpperCase(), { kind: "team", team: d.id, observer: true }])),
-  ...(S.facilitatorCode ? { [S.facilitatorCode.toUpperCase()]: { kind: "facilitator" } } : {}),
-  ...(S.projectorCode ? { [S.projectorCode.toUpperCase()]: { kind: "projector" } } : {}),
-};
 
 const MATRIX = JSON.parse(atob(S.matrixB64));
 const ISSUES = S.issues;
@@ -650,6 +633,25 @@ function draftBadge(p, endo, newestId) {
   if (n > 0) return { text: `LEADING · ${n}/${need} endorsed`, color: GREEN };
   return { text: p.id === newestId ? "NEW · no endorsements yet" : "no endorsements yet", color: "#6b6b6b" };
 }
+/* A session export (Facilitator → Export) as a fresh game document. Lands
+   paused, clock stopped, so the professor resumes when the class is ready.
+   Only the parts present in the file are carried over. */
+function docFromExport(rec) {
+  if (!rec || typeof rec !== "object") throw new Error("That file isn't a session export.");
+  if (rec.scenario !== S.meta.id) throw new Error(`That export is for scenario "${rec.scenario}", not "${S.meta.id}".`);
+  const d = {};
+  const c = rec.clock || DEFAULT_CLOCK;
+  d[K.clock] = { running: false, endsAt: null, remainingMs: c.running && c.endsAt ? Math.max(0, c.endsAt - Date.now()) : (c.remainingMs ?? DEFAULT_CLOCK.remainingMs) };
+  if (rec.props) d[K.props] = rec.props;
+  if (rec.endo) d[K.endo] = rec.endo;
+  if (rec.injects) d[K.injects] = rec.injects;
+  if (rec.comms) d[K.comms] = rec.comms;
+  if (rec.ann) d[K.ann] = rec.ann;
+  if (rec.seats) d[K.ai] = rec.seats;
+  if (rec.pub) d[K.pub] = { ...rec.pub, window: { ...rec.pub.window, endsAt: null } };
+  d[K.flags] = { ...DEFAULT_FLAGS, ...(rec.flags || {}), paused: true, pausedAt: Date.now(), winRemMs: null };
+  return d;
+}
 const DEFAULT_FLAGS = { adoptedId: null, revealed: false, collapsed: false, paused: false, pausedAt: null, winRemMs: null };
 /* v1.5 — Session pause. flags.paused locks every team view behind a holding
    screen and refuses all player ops; the clock and any open press window are
@@ -667,25 +669,12 @@ const DEFAULT_PUB = {
   domestic: {},   // v1.5: { teamId: domesticMoodKey }
 };
 
-/* Per-client probe key. A single shared probe key raced between clients:
-   projector writes stamp A, facilitator writes stamp B, projector reads back
-   B and reports a false "NOT SYNCING". Each session now probes its own key. */
-const CLIENT_ID = Math.random().toString(36).slice(2, 10);
 async function probeStorage() {
   /* A game's document is the only shared key, and a paused game or an
      unassigned student may not write it, so reading it is the probe. */
-  if (getActiveGame()) {
-    try { await withTimeout(window.storage.get(DOC_KEY, true)); return true; } catch { return false; }
-  }
-  try {
-    const stamp = String(Date.now());
-    const key = `${P}-probe-${CLIENT_ID}`;
-    await withTimeout(window.storage.set(key, stamp, true));
-    const r = await withTimeout(window.storage.get(key, true));
-    return !!r && r.value === stamp;
-  } catch { return false; }
+  if (!getActiveGame()) return false;
+  try { await withTimeout(window.storage.get(DOC_KEY, true)); return true; } catch { return false; }
 }
-
 function useShared(pollMs = 4000) {
   const [sync, setSync] = useState("checking");
   const [clock, setClock] = useState(DEFAULT_CLOCK);
@@ -1874,7 +1863,7 @@ function Facilitator({ sh, game, onExit }) {
   const rem = remainingOf(clock, now);
   const winOpen = pub.window.open && pub.window.endsAt > now;
 
-  const GM_OK = { pauseSession: "Session paused — team consoles are locked", resumeSession: "Session resumed", import: "Session restored (paused) — press Resume when ready",
+  const GM_OK = { pauseSession: "Session paused — team consoles are locked", resumeSession: "Session resumed",
     reset: "Session reset", reveal: "Scores revealed", collapse: "Talks collapsed" };
   const act = async (label, fn, okMsg) => {
     setBusy(label);
@@ -1966,10 +1955,6 @@ function Facilitator({ sh, game, onExit }) {
       note("Opened in a new tab — use the browser's Save Page As… to keep it");
     } catch { note("The browser blocked the new tab — use Copy instead", "err"); }
   };
-  const restoreFromText = (txt) => act("import", async () => {
-    const rec = JSON.parse(txt);
-    await applyImport(rec);
-  });
   // v1.5 — Session pause / resume (one atomic write across clock, window, flags).
   /* Freeze clock and press window into the doc. A no-op if already paused, so
      pausing twice never overwrites the saved window remainder. */
@@ -2022,28 +2007,6 @@ function Facilitator({ sh, game, onExit }) {
       return d;
     });
   });
-  // v1.5 — Restore from a session export. Lands the game paused so the GM can
-  // inspect before resuming. Only keys present in the file are written.
-  const importSession = (file) => act("import", async () => {
-    const txt = await file.text();
-    const rec = JSON.parse(txt);
-    await applyImport(rec);
-  });
-  const applyImport = async (rec) => {
-    if (rec.scenario !== S.meta.id) throw Object.assign(new Error("scn"), { friendly: `That export is for scenario "${rec.scenario}", not "${S.meta.id}".` });
-    await writeDoc((d) => {
-      const c = rec.clock || DEFAULT_CLOCK;
-      const cRem = c.running && c.endsAt ? Math.max(0, c.endsAt - Date.now()) : (c.remainingMs ?? DEFAULT_CLOCK.remainingMs);
-      d[K.clock] = { running: false, endsAt: null, remainingMs: cRem };
-      if (rec.props) d[K.props] = rec.props; if (rec.endo) d[K.endo] = rec.endo;
-      if (rec.injects) d[K.injects] = rec.injects; if (rec.comms) d[K.comms] = rec.comms;
-      if (rec.ann) d[K.ann] = rec.ann; if (rec.seats) d[K.ai] = rec.seats;
-      if (rec.pub) d[K.pub] = { ...rec.pub, window: { ...rec.pub.window, endsAt: null } };
-      d[K.flags] = { ...DEFAULT_FLAGS, ...(rec.flags || {}), paused: true, pausedAt: Date.now(), winRemMs: null };
-      return d;
-    });
-    aiMem.current = {};
-  };
   // Act-as-delegation failsafe. Substituted actions are logged as GM-attributed.
   const [subTeam, setSubTeam] = useState(TEAMS[0]);
   const [subDraft, setSubDraft] = useState({});
@@ -2281,11 +2244,6 @@ function Facilitator({ sh, game, onExit }) {
             className="px-3 py-2 rounded font-bold text-sm" style={{ background: PLATE, color: RED, fontFamily: BODY_HI, border: `1px solid ${RED}` }}>End game</button>
         </>}
         {game?.status === "completed" && <span className="text-sm font-bold" style={{ color: RED }}>This game has ended — results are read-only.</span>}
-        <label className="pz-btn px-3 py-2 rounded font-bold text-sm cursor-pointer inline-block" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>
-          Restore from JSON…
-          <input type="file" accept="application/json,.json" className="hidden"
-            onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) importSession(f); e.target.value = ""; }} />
-        </label>
       </div>
       {game && game.status !== "completed" && flags.paused && (
         <div className="text-sm mb-4 -mt-4" style={{ color: GREEN }}>Students can rejoin now. Press <b>Resume session</b> when everyone is back in.</div>
@@ -2300,16 +2258,10 @@ function Facilitator({ sh, game, onExit }) {
           </div>
           <textarea readOnly value={exportText} onFocus={(e) => e.target.select()} className="w-full text-xs p-2 rounded" rows={6}
             style={{ fontFamily: MONO_FONT, background: "white", color: CHARCOAL, border: 0 }} />
-          <div className="text-xs opacity-70 mt-1">Paste into any text file and save it as <b>.json</b>. To restore later, use "Restore from JSON…" with that file, or paste the text below.</div>
+          <div className="text-xs opacity-70 mt-1">Paste into any text file and save it as <b>.json</b>. To play on from it later, choose <b>New game</b> on your dashboard and pick this file.</div>
         </div>
       )}
-      <details className="mb-4 text-xs">
-        <summary className="cursor-pointer opacity-70">Restore by pasting JSON text</summary>
-        <textarea id="pz-restore-text" placeholder="Paste a session export here" className="w-full text-xs p-2 rounded mt-2" rows={4} style={{ fontFamily: MONO_FONT, background: "white", color: CHARCOAL, border: 0 }} />
-        <button onClick={() => { const el = document.getElementById("pz-restore-text"); if (el && el.value.trim()) restoreFromText(el.value); }} disabled={!!busy} aria-busy={busy === "import" ? "true" : "false"}
-          className="mt-2 px-3 py-2 rounded font-bold text-sm" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>Restore from pasted text</button>
-      </details>
-      <div className="text-xs opacity-70 mb-2" style={{ maxWidth: 520 }}>Pause locks every team console and suspends the clock and press window. Export at the end of each class session; Restore reloads it, paused.</div>
+      <div className="text-xs opacity-70 mb-2" style={{ maxWidth: 520 }}>Pause session is for a short break: it locks every team console and suspends the clock and press window. At the end of class use Pause for next class; the game is saved and resumes from your dashboard. Export keeps a copy for the debrief.</div>
 
           </div>
           <div>
@@ -2700,8 +2652,6 @@ function Facilitator({ sh, game, onExit }) {
           </div>
 
 
-          <h3 className="font-bold tracking-wide mb-2">ACCESS CODES</h3>
-          <div className="text-sm mb-2">Codes are printed on each delegation's ranking card and on the facilitator card. They are not stored in the game.</div>
         </div>
       </div>
       {designer && <details className="mt-6">
@@ -3522,8 +3472,25 @@ function NewGameForm({ onCreated, onCancel }) {
   const [title, setTitle] = useState("");
   const [minutes, setMinutes] = useState(String(S.meta.deadlineMinutes));
   const [seats, setSeats] = useState(DEFAULT_AI);
+  const [fromFile, setFromFile] = useState(null); // { name, doc, summary }
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  // Optional: continue from a session export instead of a blank game.
+  const pickFile = async (file) => {
+    setErr(""); setFromFile(null);
+    if (!file) return;
+    try {
+      const rec = JSON.parse(await file.text());
+      const doc = docFromExport(rec);
+      if (rec.seats) setSeats({ ...DEFAULT_AI, ...rec.seats });
+      const drafts = (rec.props || []).filter((x) => x.active).length;
+      const when = rec.exportedAt ? new Date(rec.exportedAt).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "an earlier session";
+      setFromFile({ name: file.name, doc, summary: `Saved ${when} · ${drafts} live draft${drafts === 1 ? "" : "s"} · ${fmt(doc[K.clock].remainingMs)} left on the clock. The game opens paused.` });
+    } catch (e) {
+      setErr(e instanceof SyntaxError ? "That file isn't valid JSON." : e.message);
+    }
+  };
 
   const create = async () => {
     const t = title.trim();
@@ -3536,7 +3503,9 @@ function NewGameForm({ onCreated, onCancel }) {
       /* Seed the new game's state with the chosen seats and clock. If this
          write fails the game still works: the clock follows setup.minutes
          anyway, and seats can be switched in the console. */
-      const seed = { [K.ai]: seats, [K.clock]: { running: false, remainingMs: m * 60 * 1000, endsAt: null } };
+      const seed = fromFile
+        ? { ...fromFile.doc, [K.ai]: seats }
+        : { [K.ai]: seats, [K.clock]: { running: false, remainingMs: m * 60 * 1000, endsAt: null } };
       await api("PUT", `/games/${game.gameId}/doc`, JSON.stringify(seed)).catch(() => {});
       onCreated(game);
     } catch (e) { setErr(e.message); setBusy(false); }
@@ -3552,6 +3521,12 @@ function NewGameForm({ onCreated, onCancel }) {
         {TEAMS.map((t) => (
           <SeatToggle key={t} team={t} value={seats[t]} onToggle={() => setSeats((s) => ({ ...s, [t]: s[t] === "ai" ? "human" : "ai" }))} />
         ))}
+      </div>
+      <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>CONTINUE FROM A SAVED EXPORT (optional)</div>
+      <div className="mb-4 text-sm">
+        <input type="file" accept="application/json,.json" aria-label="Session export file"
+          onChange={(e) => pickFile(e.target.files && e.target.files[0])} style={{ color: PAPER }} />
+        {fromFile && <div className="mt-2" style={{ color: GOLD }}>{fromFile.name}: {fromFile.summary}</div>}
       </div>
       <div className="flex gap-2 flex-wrap">
         <button onClick={create} disabled={busy} aria-busy={busy ? "true" : "false"} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>Create game</button>
@@ -3741,9 +3716,45 @@ function StudentGames() {
   );
 }
 
-/* Signed-in landing page: the professor or student dashboard. The
-   access-code gate stays reachable. */
-function AccountHome({ user, notice, onDismiss, onUseCode }) {
+/* Professor settings: the designer key turns on scoring detail in the console
+   for this browser (it used to be typed at the old access-code gate). */
+function DesignerSetting() {
+  const [on, setOn] = useState(false);
+  const [key, setKey] = useState("");
+  const [msg, setMsg] = useState("");
+  useEffect(() => { readDesigner().then(setOn); }, []);
+  const enable = async () => {
+    let h = null;
+    try { h = await codeHash(key); } catch { /* no crypto: treated as wrong key */ }
+    if (h !== DESIGNER_HASH) { setMsg("That isn't the designer key."); return; }
+    try { await window.storage.set("pz-designer", "1", false); } catch { /* per-browser only */ }
+    setOn(true); setKey(""); setMsg("");
+  };
+  const disable = async () => {
+    try { await window.storage.delete("pz-designer", false); } catch { /* per-browser only */ }
+    setOn(false);
+  };
+  return (
+    <details className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a" }}>
+      <summary className="cursor-pointer" style={{ opacity: 0.8 }}>Settings</summary>
+      <div className="mt-3 rounded p-4" style={CARD}>
+        <div className="font-bold mb-1" style={{ fontFamily: BODY_HI }}>Designer view {on ? "· on" : "· off"}</div>
+        <div className="text-xs mb-3" style={{ opacity: 0.7 }}>Shows scoring detail and authoring tools in the console, in this browser only.</div>
+        {on
+          ? <button onClick={disable} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Turn off</button>
+          : <div className="flex gap-2 flex-wrap">
+              <input type="password" value={key} onChange={(e) => setKey(e.target.value)} onKeyDown={(e) => e.key === "Enter" && enable()}
+                placeholder="Designer key" aria-label="Designer key" className="px-3 py-2 rounded" style={{ ...AUTH_INPUT, minWidth: 200 }} />
+              <button onClick={enable} className="px-3 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>Turn on</button>
+            </div>}
+        {msg && <div className="mt-2 text-sm" role="alert" style={{ color: "#ff8a70" }}>{msg}</div>}
+      </div>
+    </details>
+  );
+}
+
+/* Signed-in landing page: the professor or student dashboard. */
+function AccountHome({ user, notice, onDismiss }) {
   const prof = user.role === "professor";
   return (
     <div className="min-h-screen p-6" style={{ background: DEEP, color: PAPER, fontFamily: BODY_FONT, textAlign: "left" }}>
@@ -3766,9 +3777,7 @@ function AccountHome({ user, notice, onDismiss, onUseCode }) {
           </div>
         )}
         {prof ? <ProfessorGames /> : <StudentGames />}
-        <div className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a", opacity: 0.8 }}>
-          Using a delegation access code instead? <button onClick={onUseCode} style={AUTH_LINK}>Enter with an access code</button>
-        </div>
+        {prof && DESIGNER_HASH && <DesignerSetting />}
       </div>
     </div>
   );
@@ -3884,10 +3893,6 @@ export default function App() {
   const [user, setUser] = useState(currentUser);
   const [route, setRoute] = useState(readRoute);
   const [notice, setNotice] = useState("");
-  const [useCode, setUseCode] = useState(false);
-  const [code, setCode] = useState("");
-  const [session, setSession] = useState(null);
-  const [err, setErr] = useState("");
 
   useEffect(() => {
     const onPop = () => setRoute(readRoute());
@@ -3896,59 +3901,12 @@ export default function App() {
   }, []);
 
   // Sign-out (or an expired refresh token) anywhere returns to the login screen.
-  useEffect(() => onAuthChange(() => {
-    const u = currentUser();
-    setUser(u);
-    if (!u) { setSession(null); setUseCode(false); }
-  }), []);
-
-  const enter = async () => {
-    ensureAudio();
-    const typed = code.trim().toUpperCase();
-    let hit = ACCESS[typed];
-    if (!hit) {
-      let h = null;
-      try { h = await codeHash(typed); } catch {}
-      if (h && DESIGNER_HASH && h === DESIGNER_HASH) {
-        try { await window.storage.set("pz-designer", "1", false); } catch {}
-        hit = { kind: "facilitator" };
-      } else if (h) hit = ACCESS_HASHED[h];
-    }
-    if (!hit) { setErr("Code not recognized. Check with the facilitator."); return; }
-    setSession(hit); setErr("");
-  };
+  useEffect(() => onAuthChange(() => setUser(currentUser())), []);
 
   if (!user) return <Login onSignedIn={setUser} />;
   if (route.gameId) {
     const leave = (msg) => { setNotice(typeof msg === "string" ? msg : ""); openGame(null); };
     return <GameEntry key={route.gameId} gameId={route.gameId} view={route.view} onLeave={leave} />;
   }
-  if (!session && !useCode) return <AccountHome user={user} notice={notice} onDismiss={() => setNotice("")} onUseCode={() => setUseCode(true)} />;
-  if (!session) {
-    return (
-      <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
-        <div className="w-full max-w-sm text-center">
-          <div className="mb-3"><Wordmark light h="44px" /></div>
-          <div className="text-xs tracking-widest pz-label mb-8" style={{ color: GOLD, fontFamily: MONO_FONT }}>
-            {S.meta.gateTagline}
-          </div>
-          <div className="text-sm mb-2" style={{ color: PAPER }}>Enter your delegation access code</div>
-          <input value={code} onChange={(e) => setCode(e.target.value)} onKeyDown={(e) => e.key === "Enter" && enter()}
-            placeholder="Delegation access code" autoCapitalize="characters"
-            className="w-full px-3 py-3 rounded text-center text-lg font-bold tracking-widest mb-3"
-            style={{ background: CHARCOAL, color: GOLD, border: `2px solid ${GOLD}`, fontFamily: MONO_FONT }} />
-          <button onClick={enter} className="w-full py-3 rounded font-bold" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>
-            Enter the conference
-          </button>
-          {err && <div className="mt-3 text-sm" style={{ color: "#ff8a70" }}>{err}</div>}
-          <button onClick={() => { setUseCode(false); setErr(""); }} className="mt-4 text-sm" style={AUTH_LINK}>Back to your account</button>
-          <div className="mt-8 text-xs opacity-40" style={{ color: PAPER }}>
-            All submissions are shared with the conference system. Preference data stays on your screen.
-          </div>
-        </div>
-      </div>
-    );
-  }
-  // Access-code path: shared state lives in the old storage Lambda (?s=).
-  return <GameRoom key="access-code" kind={session.kind} team={session.team} observer={session.observer} />;
+  return <AccountHome user={user} notice={notice} onDismiss={() => setNotice("")} />;
 }
