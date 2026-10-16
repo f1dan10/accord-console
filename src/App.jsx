@@ -1704,7 +1704,7 @@ function PlayersPanel({ game, aiCtl }) {
   );
 }
 
-function Facilitator({ sh, game }) {
+function Facilitator({ sh, game, onExit }) {
   const { clock, props, endo, injects, flags, pub, comms, pull, aiCtl } = sh;
   const [now, setNow] = useState(Date.now());
   /* ---- AI seat host: this console runs every seat toggled to AI ---- */
@@ -1971,9 +1971,11 @@ function Facilitator({ sh, game }) {
     await applyImport(rec);
   });
   // v1.5 — Session pause / resume (one atomic write across clock, window, flags).
-  const pauseSession = () => act("pauseSession", async () => {
-    await writeDoc((d) => {
+  /* Freeze clock and press window into the doc. A no-op if already paused, so
+     pausing twice never overwrites the saved window remainder. */
+  const freezeDoc = () => writeDoc((d) => {
       const c = d[K.clock] || DEFAULT_CLOCK; const p = d[K.pub] || DEFAULT_PUB; const f = d[K.flags] || DEFAULT_FLAGS;
+      if (f.paused) return d;
       const nowT = Date.now();
       const cRem = c.running && c.endsAt ? Math.max(0, c.endsAt - nowT) : c.remainingMs;
       const wRem = p.window.open && p.window.endsAt ? Math.max(0, p.window.endsAt - nowT) : null;
@@ -1981,8 +1983,35 @@ function Facilitator({ sh, game }) {
       if (wRem != null) d[K.pub] = { ...p, window: { ...p.window, endsAt: null } };
       d[K.flags] = { ...f, paused: true, pausedAt: nowT, winRemMs: wRem };
       return d;
-    });
   });
+  const pauseSession = () => act("pauseSession", freezeDoc);
+  /* Account games only. End of class: freeze the game, mark it paused (students
+     can't write or rejoin until Resume on the dashboard), back to the dashboard. */
+  const saveFailed = () => Object.assign(new Error("save"), { friendly: "Couldn't save the game. Check your connection and try again." });
+  const setGameStatus = async (status) => {
+    try { await api("POST", `/games/${encodeURIComponent(game.gameId)}/status`, { status }); }
+    catch (e) { throw Object.assign(e, { friendly: e.message }); }
+  };
+  const pauseForNextClass = () => act("pauseForNextClass", async () => {
+    if (!(await freezeDoc())) throw saveFailed();
+    await setGameStatus("paused");
+    onExit(`"${game.title}" is paused. Choose Resume here when your next class starts.`);
+  });
+  // End: stop the clock for good, then mark completed (read-only; frees the word).
+  const endGame = () => act("endGame", async () => {
+    const ok = await writeDoc((d) => {
+      const c = d[K.clock] || DEFAULT_CLOCK; const p = d[K.pub] || DEFAULT_PUB; const f = d[K.flags] || DEFAULT_FLAGS;
+      const nowT = Date.now();
+      d[K.clock] = { running: false, endsAt: null, remainingMs: c.running && c.endsAt ? Math.max(0, c.endsAt - nowT) : c.remainingMs };
+      if (p.window.open) d[K.pub] = { ...p, window: { ...p.window, endsAt: null } };
+      d[K.flags] = { ...f, paused: false, pausedAt: null, winRemMs: null };
+      return d;
+    });
+    if (!ok) throw saveFailed();
+    await setGameStatus("completed");
+    onExit(`"${game.title}" has ended. Its results stay available here.`);
+  });
+  const [confirmEnd, setConfirmEnd] = useState(false);
   const resumeSession = () => act("resumeSession", async () => {
     await writeDoc((d) => {
       const c = d[K.clock] || DEFAULT_CLOCK; const p = d[K.pub] || DEFAULT_PUB; const f = d[K.flags] || DEFAULT_FLAGS;
@@ -2239,18 +2268,28 @@ function Facilitator({ sh, game }) {
       {/* ---- Session: pause / resume / export / restore ---- */}
       <h3 className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>SESSION {flags.paused && <span className="text-xs px-2 py-1 rounded ml-2" style={{ background: RED, color: PAPER }}>PAUSED — team consoles locked</span>}</h3>
       <div className="flex flex-wrap gap-2 mb-6 items-center">
-        {flags.paused
+        {game?.status === "completed" ? null : flags.paused
           ? <button onClick={resumeSession} disabled={!!busy} aria-busy={busy === "resumeSession" ? "true" : "false"} className="px-3 py-2 rounded font-bold text-sm" style={{ background: GREEN, color: PAPER }}>▶ Resume session</button>
           : <button onClick={pauseSession} disabled={!!busy} aria-busy={busy === "pauseSession" ? "true" : "false"} className="px-3 py-2 rounded font-bold text-sm" style={{ background: RED, color: PAPER }}>❚❚ Pause session (locks all teams)</button>}
         <button onClick={exportSession} disabled={!!busy} className="px-3 py-2 rounded font-bold text-sm" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>
           Export full session (JSON)
         </button>
+        {game && game.status !== "completed" && <>
+          <button onClick={pauseForNextClass} disabled={!!busy} aria-busy={busy === "pauseForNextClass" ? "true" : "false"}
+            className="px-3 py-2 rounded font-bold text-sm" style={{ background: GOLD, color: CHARCOAL, fontFamily: BODY_HI }}>❚❚ Pause for next class</button>
+          <button onClick={() => setConfirmEnd(true)} disabled={!!busy} aria-busy={busy === "endGame" ? "true" : "false"}
+            className="px-3 py-2 rounded font-bold text-sm" style={{ background: PLATE, color: RED, fontFamily: BODY_HI, border: `1px solid ${RED}` }}>End game</button>
+        </>}
+        {game?.status === "completed" && <span className="text-sm font-bold" style={{ color: RED }}>This game has ended — results are read-only.</span>}
         <label className="pz-btn px-3 py-2 rounded font-bold text-sm cursor-pointer inline-block" style={{ background: CHARCOAL, color: PAPER, fontFamily: BODY_HI }}>
           Restore from JSON…
           <input type="file" accept="application/json,.json" className="hidden"
             onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) importSession(f); e.target.value = ""; }} />
         </label>
       </div>
+      {game && game.status !== "completed" && flags.paused && (
+        <div className="text-sm mb-4 -mt-4" style={{ color: GREEN }}>Students can rejoin now. Press <b>Resume session</b> when everyone is back in.</div>
+      )}
       {exportText != null && (
         <div className="p-3 rounded mb-4" style={{ background: PLATE }}>
           <div className="text-xs pz-label mb-2" style={{ opacity: 0.7 }}>SESSION EXPORT · {S.meta.id} · {new Date().toLocaleString()}</div>
@@ -2284,6 +2323,18 @@ function Facilitator({ sh, game }) {
         </button>
         <button onClick={() => setConfirmReset(true)} disabled={!!busy} className="px-3 py-2 rounded font-bold text-sm"
           style={{ background: PLATE, color: RED, fontFamily: BODY_HI }}>Reset game</button>
+        {confirmEnd && (
+          <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(16,19,20,0.75)" }} onClick={() => setConfirmEnd(false)}>
+            <div className="p-5 rounded max-w-md" style={{ background: PAPER, color: CHARCOAL }} onClick={(e) => e.stopPropagation()}>
+              <div className="font-bold text-lg mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.04em" }}>END THIS GAME?</div>
+              <div className="text-sm mb-4">The clock stops for good and nobody can make further moves. Students keep read-only access to the results, and the code <b>{game?.code.toUpperCase()}</b> is released. To continue in a later class instead, use <b>Pause for next class</b>.</div>
+              <div className="flex gap-2 justify-end">
+                <button onClick={() => setConfirmEnd(false)} className="px-3 py-2 rounded font-bold text-sm" style={{ background: PLATE, color: CHARCOAL, fontFamily: BODY_HI }}>Cancel</button>
+                <button onClick={() => { setConfirmEnd(false); endGame(); }} className="px-3 py-2 rounded font-bold text-sm" style={{ background: RED, color: PAPER, fontFamily: BODY_HI }}>Yes, end the game</button>
+              </div>
+            </div>
+          </div>
+        )}
         {confirmReset && (
           <div className="fixed inset-0 z-50 flex items-center justify-center p-6" style={{ background: "rgba(16,19,20,0.75)" }} onClick={() => setConfirmReset(false)}>
             <div className="p-5 rounded max-w-md" style={{ background: PAPER, color: CHARCOAL }} onClick={(e) => e.stopPropagation()}>
@@ -3692,7 +3743,7 @@ function StudentGames() {
 
 /* Signed-in landing page: the professor or student dashboard. The
    access-code gate stays reachable. */
-function AccountHome({ user, onUseCode }) {
+function AccountHome({ user, notice, onDismiss, onUseCode }) {
   const prof = user.role === "professor";
   return (
     <div className="min-h-screen p-6" style={{ background: DEEP, color: PAPER, fontFamily: BODY_FONT, textAlign: "left" }}>
@@ -3708,6 +3759,12 @@ function AccountHome({ user, onUseCode }) {
           </div>
         </div>
         <GoldRule />
+        {notice && (
+          <div className="mt-6 p-3 rounded flex items-start gap-3 text-sm" role="status" style={{ background: CHARCOAL, border: `1px solid ${GOLD}` }}>
+            <span className="flex-1">{notice}</span>
+            <button onClick={onDismiss} aria-label="Dismiss" style={{ ...AUTH_LINK, textDecoration: "none" }}>✕</button>
+          </div>
+        )}
         {prof ? <ProfessorGames /> : <StudentGames />}
         <div className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a", opacity: 0.8 }}>
           Using a delegation access code instead? <button onClick={onUseCode} style={AUTH_LINK}>Enter with an access code</button>
@@ -3719,10 +3776,10 @@ function AccountHome({ user, onUseCode }) {
 
 /* One mounted game. Keyed by game id by its parent, so polling, timers and
    the AI host all start fresh when a different game is opened. */
-function GameRoom({ kind, team, observer, game }) {
+function GameRoom({ kind, team, observer, game, onExit }) {
   const sh = useShared(5000);
   if (kind === "projector") return <Projector sh={sh} />;
-  if (kind === "facilitator") return <Facilitator sh={sh} game={game} />;
+  if (kind === "facilitator") return <Facilitator sh={sh} game={game} onExit={onExit} />;
   return <TeamView team={team} sh={sh} observer={!!observer} />;
 }
 
@@ -3746,6 +3803,8 @@ function GameMessage({ title, message, onLeave }) {
    every few seconds. */
 function GameEntry({ gameId, view, onLeave }) {
   const [state, setState] = useState({ phase: "loading" });
+  const onLeaveRef = React.useRef(onLeave);
+  useEffect(() => { onLeaveRef.current = onLeave; });
 
   useEffect(() => {
     let alive = true, timer = null, inRoom = false;
@@ -3754,6 +3813,13 @@ function GameEntry({ gameId, view, onLeave }) {
         const { game, membership } = await api("GET", `/games/${encodeURIComponent(gameId)}`);
         if (!alive) return;
         const owner = game.ownerId === membership.userId;
+        // A student who was playing when the professor paused or ended goes home with a notice.
+        if (!owner && inRoom && (game.status === "paused" || game.status === "completed")) {
+          onLeaveRef.current(game.status === "paused"
+            ? `Your professor paused "${game.title}" for next class. Your work is saved; you'll be able to rejoin once they resume it.`
+            : `"${game.title}" has ended. You can view the results from your games.`);
+          return;
+        }
         let room = null, wait = null;
         if (owner) room = { kind: view === "projector" ? "projector" : "facilitator" };
         else if (game.status === "paused") wait = "This game is paused. Your professor will resume it.";
@@ -3794,7 +3860,7 @@ function GameEntry({ gameId, view, onLeave }) {
   if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
   if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;
   if (state.phase === "wait") return <GameMessage title={state.game.title} message={state.message} onLeave={onLeave} />;
-  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}:${state.room.observer ? "ro" : "rw"}`} {...state.room} game={state.game} />;
+  return <GameRoom key={`${gameId}:${state.room.kind}:${state.room.team || ""}:${state.room.observer ? "ro" : "rw"}`} {...state.room} game={state.game} onExit={onLeave} />;
 }
 
 /* ?game=<id>[&view=projector] in the address bar is the open game, so a
@@ -3817,6 +3883,7 @@ export default function App() {
   useFontEmbed();
   const [user, setUser] = useState(currentUser);
   const [route, setRoute] = useState(readRoute);
+  const [notice, setNotice] = useState("");
   const [useCode, setUseCode] = useState(false);
   const [code, setCode] = useState("");
   const [session, setSession] = useState(null);
@@ -3852,8 +3919,11 @@ export default function App() {
   };
 
   if (!user) return <Login onSignedIn={setUser} />;
-  if (route.gameId) return <GameEntry key={route.gameId} gameId={route.gameId} view={route.view} onLeave={() => openGame(null)} />;
-  if (!session && !useCode) return <AccountHome user={user} onUseCode={() => setUseCode(true)} />;
+  if (route.gameId) {
+    const leave = (msg) => { setNotice(typeof msg === "string" ? msg : ""); openGame(null); };
+    return <GameEntry key={route.gameId} gameId={route.gameId} view={route.view} onLeave={leave} />;
+  }
+  if (!session && !useCode) return <AccountHome user={user} notice={notice} onDismiss={() => setNotice("")} onUseCode={() => setUseCode(true)} />;
   if (!session) {
     return (
       <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
