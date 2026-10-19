@@ -380,10 +380,23 @@ function receptionLabel(net) {
    It is inserted into release builds from a private file. The placeholder keeps the
    grader working end to end: three dimensions, each scored 0–5, plus relevance 0–3. */
 const RUBRIC_TEXT = "DIMENSION A (placeholder): 0-5, how well the statement is supported.\nDIMENSION B (placeholder): 0-5, how well the statement is argued.\nDIMENSION C (placeholder): 0-5, how well the statement resonates with its audience.";
-/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is chosen server-side. */
-const AI_URL = `${import.meta.env.VITE_API_URL}/ai`;
+/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is chosen server-side.
+   VITE_API_URL deliberately has NO default: template.yaml generates the API Gateway URL fresh on
+   every `sam deploy`, so there is no stable value to hardcode. When it is missing we disable the
+   AI paths loudly instead of silently scoring every statement 2/2/2. */
+const API_BASE = import.meta.env.VITE_API_URL;
+const AI_CONFIGURED = typeof API_BASE === "string" && /^https?:\/\//.test(API_BASE);
+const AI_URL = AI_CONFIGURED ? `${API_BASE.replace(/\/+$/, "")}/ai` : null;
+if (!AI_CONFIGURED) {
+  console.error(
+    "[accord] VITE_API_URL is not set to a URL. Statement scoring and AI communiqués are DISABLED. " +
+    "Copy .env.example to .env.local, set VITE_API_URL to the ApiUrl output from `sam deploy`, " +
+    "then RESTART the dev server — Vite only reads env files at startup."
+  );
+}
 const RUBRIC_LABELS = ["Dimension A", "Dimension B", "Dimension C"];
 async function scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars }) {
+  if (!AI_URL) throw new Error("ai-not-configured");
   const exBlock = exemplars && exemplars.length
     ? `\n\nCALIBRATION EXAMPLES \u2014 these were graded by the head facilitator. Match this standard exactly.\n` +
       exemplars.map((x, i) =>
@@ -820,8 +833,9 @@ async function opFileCommunique(team, { posture, subject, subjectLabel, text, mo
   try {
     const exemplars = await sGet(K.exemplars, []);
     sx = await scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars });
-  } catch {
-    sx = { e: 2, l: 2, p: 2, ad_hominem: false };
+  } catch (err) {
+    console.warn("[accord] statement scoring failed — applying neutral placeholder:", err);
+    sx = { e: 2, l: 2, p: 2, ad_hominem: false, unscored: true };
   }
   const { net } = computeNet(sx, posture, moodKey);
   /* Atomic over pub (credibility + sentiment) AND comms scoring — computed
@@ -1034,6 +1048,7 @@ async function composeAiCommunique(team, { subject, posture, leadTeam, moodDispa
     : subject.stance === "for"
       ? `${MINISTRY[team].speaker} welcomes the ${leadTeam} text as a serious basis for agreement, and calls on all delegations to move from posturing to signature.`
       : `${MINISTRY[team].speaker} cannot accept the ${leadTeam} text as drafted${worstIss ? `, above all on ${worstIss.label.toLowerCase().replace(/\?$/, "")}` : ""}. A durable agreement will not be built on terms our public cannot defend.`;
+  if (!AI_URL) return fallback;
   try {
     const prompt = `You write one official communiqué (max 380 characters, no quotation marks around it, no preamble) for ${MINISTRY[team].wire} in ${PD.scoringContext}. Posture: ${posture}. Subject: ${subjectLabel}. Current press climate: "${moodDispatch}". Speak in the institutional first-person plural of ${MINISTRY[team].speaker}. Be specific and rhetorically strong — cite a principle or fact, reason clearly, and match the public temperature. Output ONLY the statement text.`;
     const res = await fetch(AI_URL, {
@@ -2044,7 +2059,14 @@ function Facilitator({ sh }) {
         </div>
       </div>
       <GoldRule />
-
+      {!AI_CONFIGURED && (
+        <div className="p-3 rounded mt-3 font-bold text-sm" role="alert"
+          style={{ background: RED, color: PAPER, fontFamily: BODY_HI }}>
+          ⚠ AI backend not configured (VITE_API_URL missing). Statements will NOT be scored —
+          every filing receives a neutral placeholder — and AI seats will speak in canned text.
+          Set VITE_API_URL and rebuild before running a session.
+        </div>
+      )}
       {/* v1.5 — COMMAND PANEL: everything the GM touches during play, above the fold */}
       <div className="mt-3 p-4 rounded" style={{ background: PLATE }}>
         <div className="flex flex-wrap items-start gap-x-10 gap-y-4">
@@ -2504,7 +2526,7 @@ function Facilitator({ sh }) {
           <div className="text-xs mb-2 opacity-70">Current mood <b>{pub.mood}</b> — weights E×{MOODS[pub.mood]?.we} L×{MOODS[pub.mood]?.wl} P×{MOODS[pub.mood]?.wp}
             {MOODS[pub.mood]?.favored.length ? ` \u00b7 favors ${MOODS[pub.mood].favored.join(", ")}` : ""}
             {MOODS[pub.mood]?.penalized.length ? ` \u00b7 penalizes ${MOODS[pub.mood].penalized.join(", ")}` : ""}</div>
-          
+
           <h3 className="font-bold tracking-wide mt-6 mb-2">TEST BENCH <span className="font-normal text-xs opacity-60">(scores a sample — affects nothing)</span></h3>
           <textarea value={benchText} onChange={(e) => setBenchText(e.target.value.slice(0, 400))} rows={3}
             placeholder="Paste or write a sample statement…"
