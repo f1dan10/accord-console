@@ -10,7 +10,11 @@ Parameters:
   AllowedOrigin:
     Type: String
     Default: "*"
-    Description: Frontend origin allowed by CORS (set to the CloudFront URL once it exists)
+    Description: Frontend origin allowed by CORS (set to the SiteUrl output once it exists)
+  DevOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Second CORS origin for local development (vite dev server)
   ProfessorEmails:
     Type: String
     Default: ""
@@ -27,7 +31,7 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       CorsConfiguration:
-        AllowOrigins: [!Ref AllowedOrigin]
+        AllowOrigins: [!Ref AllowedOrigin, !Ref DevOrigin]
         AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
         AllowHeaders: [content-type, authorization]
       # Sized for several classes polling at once (~1 request / 5 s per browser).
@@ -266,7 +270,77 @@ Resources:
             Path: /ai
             Method: POST
 
+  # Static frontend: private bucket, served only through CloudFront (OAC).
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed CachingOptimized. Hashed assets cache long; `npm run deploy:web`
+          # invalidates /index.html so new builds show up immediately.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # S3 answers 403 for missing keys; routing is query-string based (?game=…),
+        # so any miss just gets the app shell.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
 Outputs:
+  SiteUrl:
+    Description: Public frontend URL (use as AllowedOrigin)
+    Value: !Sub https://${SiteDistribution.DomainName}
+  SiteBucketName:
+    Description: Bucket that `npm run deploy:web` syncs dist/ into
+    Value: !Ref SiteBucket
+  SiteDistributionId:
+    Description: Distribution that `npm run deploy:web` invalidates
+    Value: !Ref SiteDistribution
   ApiUrl:
     Description: Base URL for VITE_API_URL
     Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
