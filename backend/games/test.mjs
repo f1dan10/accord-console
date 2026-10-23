@@ -6,10 +6,16 @@ import { makeHandler, CodeTaken, StaleStatus } from "./app.mjs";
 import { WORDS } from "./words.mjs";
 
 function memoryStore() {
-  const games = new Map(), docs = new Map(), members = new Map(), codes = new Map();
+  const games = new Map(), docs = new Map(), members = new Map(), codes = new Map(), professors = new Map();
   const mk = (u, g) => `${u}|${g}`;
   return {
-    games, codes,
+    games, codes, professors,
+    async listProfessors() { return [...professors.values()]; },
+    async addProfessor(row) {
+      if (professors.has(row.email)) return professors.get(row.email);
+      professors.set(row.email, { ...row }); return null;
+    },
+    async removeProfessor(email) { return professors.delete(email); },
     async getGame(id) { return games.get(id) || null; },
     async getMember(u, g) { return members.get(mk(u, g)) || null; },
     async listMembers(g) { return [...members.values()].filter((m) => m.gameId === g); },
@@ -48,13 +54,14 @@ function setup(words = ["southern", "maple"]) {
   let w = 0, id = 0;
   const handler = makeHandler(store, {
     randomWord: () => words[w++ % words.length],
+    rootProfessors: [" X@mit.edu ", ""],
     now: () => new Date(Date.UTC(2026, 9, 15) + ++clock * 1000).toISOString(),
     newId: () => `game-${++id}`,
   });
-  const as = (user) => async (routeKey, { gameId, body, raw } = {}) => {
+  const as = (user) => async (routeKey, { gameId, email, body, raw } = {}) => {
     const r = await handler({
       routeKey,
-      pathParameters: gameId ? { gameId } : undefined,
+      pathParameters: gameId ? { gameId } : email ? { email } : undefined,
       body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
       requestContext: { authorizer: { jwt: { claims: { token_use: "id", ...user } } } },
     });
@@ -154,4 +161,40 @@ test("games are invisible to non-members", async () => {
   }
   assert.deepEqual((await t.bob("GET /games")).body.games, []);
   assert.deepEqual((await t.profY("GET /games")).body.games, []);
+});
+
+test("professors invite and revoke professors; bootstrap and self are protected", async () => {
+  const t = setup();
+  const list = async (who = t.profX) => (await who("GET /professors")).body.professors;
+
+  // Students can't see or change the list.
+  assert.equal((await t.alice("GET /professors")).status, 403);
+  assert.equal((await t.alice("POST /professors", { body: { email: "a@mit.edu" } })).status, 403);
+  assert.equal((await t.alice("DELETE /professors/{email}", { email: "y@mit.edu" })).status, 403);
+
+  // Bootstrap professors come from config, normalized.
+  assert.deepEqual(await list(), [{ email: "x@mit.edu", status: "active", root: true, invitedByName: null, invitedAt: null }]);
+
+  // Invite: validated, lowercased, idempotent; re-inviting a bootstrap email is a no-op.
+  assert.equal((await t.profX("POST /professors", { body: { email: "not-an-email" } })).status, 400);
+  const inv = await t.profX("POST /professors", { body: { email: "  New.Prof@MIT.edu " } });
+  assert.equal(inv.status, 201);
+  assert.equal(inv.body.professor.email, "new.prof@mit.edu");
+  assert.equal(inv.body.professor.status, "invited");
+  assert.equal(inv.body.professor.invitedByName, "Prof X");
+  t.store.professors.get("new.prof@mit.edu").status = "active"; // as the pre-token trigger would
+  const again = await t.profY("POST /professors", { body: { email: "new.prof@mit.edu" } });
+  assert.equal(again.status, 200);
+  assert.equal(again.body.professor.status, "active", "a second invite doesn't reset the row");
+  assert.equal((await t.profX("POST /professors", { body: { email: "x@mit.edu" } })).status, 200);
+  assert.equal(t.store.professors.has("x@mit.edu"), false);
+  assert.deepEqual((await list()).map((p) => p.email), ["x@mit.edu", "new.prof@mit.edu"]);
+
+  // Revoke: not yourself, not bootstrap, 404 for unknown; path value may arrive encoded.
+  await t.profX("POST /professors", { body: { email: "y@mit.edu" } });
+  assert.equal((await t.profY("DELETE /professors/{email}", { email: "y@mit.edu" })).status, 400);
+  assert.equal((await t.profY("DELETE /professors/{email}", { email: "x@mit.edu" })).status, 403);
+  assert.equal((await t.profX("DELETE /professors/{email}", { email: "nobody@mit.edu" })).status, 404);
+  assert.equal((await t.profY("DELETE /professors/{email}", { email: "New.Prof%40mit.edu" })).status, 200);
+  assert.deepEqual((await list()).map((p) => p.email), ["x@mit.edu", "y@mit.edu"]);
 });

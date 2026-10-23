@@ -1,7 +1,7 @@
 import { DynamoDBClient } from "@aws-sdk/client-dynamodb";
 import {
   DynamoDBDocumentClient, GetCommand, QueryCommand, BatchGetCommand,
-  UpdateCommand, TransactWriteCommand,
+  UpdateCommand, TransactWriteCommand, ScanCommand, PutCommand, DeleteCommand,
 } from "@aws-sdk/lib-dynamodb";
 import { gzipSync, gunzipSync } from "node:zlib";
 import { CodeTaken, DocTooLarge, StaleStatus } from "./app.mjs";
@@ -16,6 +16,7 @@ const T = {
   docs: process.env.DOCS_TABLE,
   members: process.env.MEMBERS_TABLE,
   codes: process.env.CODES_TABLE,
+  professors: process.env.PROFESSORS_TABLE,
 };
 // DynamoDB items cap at 400 KB; leave headroom for the other attributes.
 const MAX_DOC_GZ_BYTES = 350_000;
@@ -176,5 +177,35 @@ export const dynamoStore = {
       if (e.name === "ConditionalCheckFailedException" || cancelledOnCondition(e, 0)) throw new StaleStatus();
       throw e;
     }
+  },
+
+  // A handful of rows per course, so a scan is fine.
+  async listProfessors() {
+    const items = [];
+    let ExclusiveStartKey;
+    do {
+      const r = await ddb.send(new ScanCommand({ TableName: T.professors, ExclusiveStartKey }));
+      items.push(...(r.Items || []));
+      ExclusiveStartKey = r.LastEvaluatedKey;
+    } while (ExclusiveStartKey);
+    return items;
+  },
+
+  /* Insert-if-absent. Returns the existing row when the email is already on
+     the list (so a second invite doesn't reset an active professor), else null. */
+  async addProfessor(row) {
+    try {
+      await ddb.send(new PutCommand({ TableName: T.professors, Item: row, ConditionExpression: "attribute_not_exists(email)" }));
+      return null;
+    } catch (e) {
+      if (e.name !== "ConditionalCheckFailedException") throw e;
+      const r = await ddb.send(new GetCommand({ TableName: T.professors, Key: { email: row.email } }));
+      return r.Item || null;
+    }
+  },
+
+  async removeProfessor(email) {
+    const r = await ddb.send(new DeleteCommand({ TableName: T.professors, Key: { email }, ReturnValues: "ALL_OLD" }));
+    return !!r.Attributes;
   },
 };

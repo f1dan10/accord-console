@@ -3348,15 +3348,25 @@ const AUTH_TITLES = {
   forgot: "Reset your password", reset: "Choose a new password",
 };
 
+/* A professor invite link is <site>#invite=<email>. The email rides in the
+   fragment so it never reaches the server or its logs. Read once, then cleared. */
+function takeInvite() {
+  const m = location.hash.match(/^#invite=(.+)$/);
+  if (!m) return null;
+  history.replaceState(null, "", `${location.pathname}${location.search}`);
+  try { return decodeURIComponent(m[1]); } catch { return null; }
+}
+
 function Login({ onSignedIn }) {
-  const [mode, setMode] = useState("signin");
-  const [email, setEmail] = useState("");
+  const [invite] = useState(takeInvite);
+  const [mode, setMode] = useState(invite ? "signup" : "signin");
+  const [email, setEmail] = useState(invite || "");
   const [password, setPassword] = useState("");
   const [name, setName] = useState("");
   const [code, setCode] = useState("");
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState(authConfigured ? "" : "Sign-in isn't configured for this build (VITE_COGNITO_* missing).");
-  const [info, setInfo] = useState("");
+  const [info, setInfo] = useState(invite ? "You've been invited as a professor. Create your account with this email, or sign in if you already have one." : "");
 
   const go = (m, msg = "") => { setMode(m); setErr(""); setInfo(msg); setCode(""); };
   const run = async (fn) => {
@@ -3753,6 +3763,105 @@ function DesignerSetting() {
   );
 }
 
+/* Professors: everyone who signs in with the professor role. Any professor can
+   invite by email (they get a link to send) or remove an invited professor;
+   professors from the deployment config are fixed. */
+const inviteUrl = (email) => `${location.origin}${location.pathname}#invite=${encodeURIComponent(email)}`;
+const PROF_STATUS = { active: "SIGNED IN", invited: "INVITED" };
+
+function ProfessorsPanel({ me }) {
+  const [list, setList] = useState(null);
+  const [email, setEmail] = useState("");
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [sent, setSent] = useState(null); // { email, url, copied }
+
+  const load = useCallback(async () => {
+    try { setList((await api("GET", "/professors")).professors); setErr(""); }
+    catch (e) { setErr(e.message); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const copy = async (url) => {
+    try { await navigator.clipboard.writeText(url); return true; } catch { return false; }
+  };
+
+  const invite = async (e) => {
+    e.preventDefault();
+    const addr = email.trim();
+    if (!addr) { setErr("Type the new professor's email."); return; }
+    setBusy("invite"); setErr("");
+    try {
+      const { professor } = await api("POST", "/professors", { email: addr });
+      const url = inviteUrl(professor.email);
+      setSent({ email: professor.email, url, copied: await copy(url) });
+      setEmail("");
+      load();
+    } catch (e2) { setErr(e2.message); }
+    setBusy("");
+  };
+
+  const remove = async (p) => {
+    if (!window.confirm(`Remove ${p.email} as a professor? They keep their games but can't create new ones once their session renews (within an hour).`)) return;
+    setBusy(p.email); setErr("");
+    try { await api("DELETE", `/professors/${encodeURIComponent(p.email)}`); load(); }
+    catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+
+  return (
+    <details className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a" }}>
+      <summary className="cursor-pointer" style={{ opacity: 0.8 }}>Invite or manage professors</summary>
+      <div className="mt-3 rounded p-4" style={CARD}>
+        <form onSubmit={invite} className="mb-4">
+          <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>INVITE A PROFESSOR</div>
+          <div className="flex gap-2 flex-wrap">
+            <input type="email" value={email} onChange={(e) => setEmail(e.target.value)} placeholder="colleague@university.edu"
+              aria-label="New professor's email" className="flex-1 px-3 py-2 rounded" style={{ ...AUTH_INPUT, minWidth: 200 }} />
+            <button type="submit" disabled={busy === "invite"} aria-busy={busy === "invite" ? "true" : "false"}
+              className="px-3 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>Invite</button>
+          </div>
+        </form>
+        {sent && (
+          <div className="mb-4 p-3 rounded" role="status" style={{ border: `1px solid ${GOLD}` }}>
+            <div className="mb-2">
+              <b>{sent.email}</b> can now sign in as a professor. {sent.copied ? "The invite link is copied: " : "Send them this link: "}
+              paste it into an email to them.
+            </div>
+            <div className="flex gap-2 flex-wrap items-center">
+              <input readOnly value={sent.url} onFocus={(e) => e.target.select()} aria-label="Invite link"
+                className="flex-1 px-2 py-1 rounded text-xs" style={{ ...AUTH_INPUT, fontFamily: MONO_FONT, minWidth: 200 }} />
+              <button onClick={async () => setSent({ ...sent, copied: await copy(sent.url) })} className="px-3 py-1 rounded text-sm" style={BTN_SECONDARY}>
+                {sent.copied ? "Copied" : "Copy link"}
+              </button>
+            </div>
+            <div className="mt-2 text-xs" style={{ opacity: 0.7 }}>If they already have a student account, they need to sign out and back in.</div>
+          </div>
+        )}
+        {err && <div className="mb-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+        {list === null && !err && <div style={{ opacity: 0.7 }}>Loading…</div>}
+        <div className="flex flex-col gap-2">
+          {(list || []).map((p) => (
+            <div key={p.email} className="flex items-center gap-2 flex-wrap">
+              <span className="flex-1" style={{ minWidth: 180, wordBreak: "break-all" }}>
+                {p.email}
+                {p.invitedByName && <span className="text-xs" style={{ opacity: 0.6 }}> · invited by {p.invitedByName} {shortDate(p.invitedAt)}</span>}
+              </span>
+              <span className="text-xs px-2 py-1 rounded font-bold" style={{ border: "1px solid #5a6061", fontFamily: MONO_FONT }}>
+                {p.root ? "ADMIN" : PROF_STATUS[p.status] || p.status.toUpperCase()}
+              </span>
+              {!p.root && p.email !== (me.email || "").toLowerCase() && (
+                <button onClick={() => remove(p)} disabled={busy === p.email} aria-busy={busy === p.email ? "true" : "false"}
+                  className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Remove</button>
+              )}
+            </div>
+          ))}
+        </div>
+      </div>
+    </details>
+  );
+}
+
 /* Signed-in landing page: the professor or student dashboard. */
 function AccountHome({ user, notice, onDismiss }) {
   const prof = user.role === "professor";
@@ -3777,6 +3886,7 @@ function AccountHome({ user, notice, onDismiss }) {
           </div>
         )}
         {prof ? <ProfessorGames /> : <StudentGames />}
+        {prof && <ProfessorsPanel me={user} />}
         {prof && DESIGNER_HASH && <DesignerSetting />}
       </div>
     </div>

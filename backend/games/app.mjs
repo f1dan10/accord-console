@@ -7,7 +7,9 @@
    - members read a game and its state document; the owner also sees members
    - students write the state only while the game is lobby/live AND they have
      been assigned a delegation; the owner may also write while paused
-   - only the owner assigns delegations and changes status */
+   - only the owner assigns delegations and changes status
+   - any professor invites or revokes professors; bootstrap professors
+     (PROFESSOR_EMAILS) can't be revoked, and nobody revokes themselves */
 
 export const TRANSITIONS = {
   lobby: ["live", "completed"],
@@ -18,6 +20,8 @@ export const TRANSITIONS = {
 const JOINABLE = new Set(["lobby", "live"]);
 const DELEGATION_RE = /^[A-Za-z0-9_-]{1,40}$/;
 const CODE_RE = /^[a-z]{2,20}[0-9]{0,2}$/;
+const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+const MAX_EMAIL = 254;
 const MAX_TITLE = 80;
 const MAX_SETUP_CHARS = 4000;
 export const MAX_DOC_CHARS = 2_000_000; // raw JSON; the store also caps the gzipped size
@@ -62,8 +66,15 @@ const publicMember = (m) => ({
   userId: m.userId, name: m.name, email: m.email, role: m.role,
   delegation: m.delegation ?? null, joinedAt: m.joinedAt,
 });
+const publicProfessor = (p) => ({
+  email: p.email, status: p.status, root: !!p.root,
+  invitedByName: p.invitedByName ?? null, invitedAt: p.invitedAt ?? null,
+});
+const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
 
-export function makeHandler(store, { randomWord, now = () => new Date().toISOString(), newId = () => crypto.randomUUID() }) {
+export function makeHandler(store, { randomWord, rootProfessors = [], now = () => new Date().toISOString(), newId = () => crypto.randomUUID() }) {
+  const roots = new Set(rootProfessors.map(normalizeEmail).filter(Boolean));
+  const requireProfessor = (me) => { if (me.role !== "professor") fail(403, "Only professors can manage professors."); };
   /* Load a game the caller belongs to. Non-members get 404, not 403, so game
      ids can't be probed. */
   async function memberGame(me, gameId) {
@@ -182,6 +193,37 @@ export function makeHandler(store, { randomWord, now = () => new Date().toISOStr
         if (e instanceof StaleStatus) fail(409, "The game changed in the meantime. Reload and try again.");
         throw e;
       }
+    },
+
+    async "GET /professors"(me) {
+      requireProfessor(me);
+      const invited = (await store.listProfessors()).filter((p) => !roots.has(p.email));
+      const list = [...[...roots].map((email) => ({ email, status: "active", root: true })), ...invited]
+        .map(publicProfessor)
+        .sort((a, b) => (b.root - a.root) || a.email.localeCompare(b.email));
+      return json(200, { professors: list });
+    },
+
+    /* Idempotent: inviting someone already on the list returns their row. */
+    async "POST /professors"(me, event) {
+      requireProfessor(me);
+      const email = normalizeEmail(readJson(event).email);
+      if (!EMAIL_RE.test(email) || email.length > MAX_EMAIL) fail(400, "Enter a valid email address.");
+      if (roots.has(email)) return json(200, { professor: publicProfessor({ email, status: "active", root: true }) });
+      const row = { email, status: "invited", invitedBy: me.userId, invitedByName: me.name, invitedAt: now() };
+      const existing = await store.addProfessor(row);
+      return existing
+        ? json(200, { professor: publicProfessor(existing) })
+        : json(201, { professor: publicProfessor(row) });
+    },
+
+    async "DELETE /professors/{email}"(me, event) {
+      requireProfessor(me);
+      const email = normalizeEmail(decodeURIComponent(event.pathParameters?.email || ""));
+      if (email === normalizeEmail(me.email)) fail(400, "You can't remove yourself.");
+      if (roots.has(email)) fail(403, "This professor is set in the deployment config and can't be removed here.");
+      if (!(await store.removeProfessor(email))) fail(404, "That email isn't on the professor list.");
+      return json(200, { ok: true });
     },
   };
 

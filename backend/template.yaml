@@ -18,7 +18,7 @@ Parameters:
   ProfessorEmails:
     Type: String
     Default: ""
-    Description: Comma-separated emails that sign in with the professor role; everyone else is a student
+    Description: Comma-separated bootstrap professors (can't be revoked in the app); others are invited through the Professors table
 
 Globals:
   Function:
@@ -102,6 +102,12 @@ Resources:
       Environment:
         Variables:
           PROFESSOR_EMAILS: !Ref ProfessorEmails
+          PROFESSORS_TABLE: !Ref ProfessorsTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ProfessorsTable.Arn
       Events:
         PreToken:
           Type: Cognito
@@ -163,6 +169,17 @@ Resources:
       KeySchema:
         - { AttributeName: code, KeyType: HASH }
 
+  # Professors invited through the app, keyed by lowercased email. Bootstrap
+  # professors (ProfessorEmails) are not stored here.
+  ProfessorsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: email, KeyType: HASH }
+
   GamesFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -175,12 +192,39 @@ Resources:
           DOCS_TABLE: !Ref GameDocsTable
           MEMBERS_TABLE: !Ref MembersTable
           CODES_TABLE: !Ref CodesTable
+          PROFESSORS_TABLE: !Ref ProfessorsTable
+          PROFESSOR_EMAILS: !Ref ProfessorEmails
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref GamesTable }
         - DynamoDBCrudPolicy: { TableName: !Ref GameDocsTable }
         - DynamoDBCrudPolicy: { TableName: !Ref MembersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref CodesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
       Events:
+        ListProfessors:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        InviteProfessor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        RevokeProfessor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors/{email}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoJwt
         ListGames:
           Type: HttpApi
           Properties:
