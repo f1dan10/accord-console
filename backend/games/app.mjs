@@ -9,7 +9,10 @@
      been assigned a delegation; the owner may also write while paused
    - only the owner assigns delegations and changes status
    - any professor invites or revokes professors; bootstrap professors
-     (PROFESSOR_EMAILS) can't be revoked, and nobody revokes themselves */
+     (PROFESSOR_EMAILS) can't be revoked, and nobody revokes themselves
+   - professors share one scenario library; only the uploader replaces or
+     deletes a scenario. A game copies its scenario when it is created, so
+     later changes to the library never reach a running game. */
 
 export const TRANSITIONS = {
   lobby: ["live", "completed"],
@@ -24,6 +27,8 @@ const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 const MAX_EMAIL = 254;
 const MAX_TITLE = 80;
 const MAX_SETUP_CHARS = 4000;
+export const MAX_SCENARIO_CHARS = 200_000; // serialized cartridge JSON (src/cartridge.js uses the same cap)
+const MAX_SCENARIO_TITLE = 200;
 export const MAX_DOC_CHARS = 2_000_000; // raw JSON; the store also caps the gzipped size
 
 export class CodeTaken extends Error {}
@@ -60,8 +65,38 @@ function readJson(event) {
 const publicGame = (g) => ({
   gameId: g.gameId, title: g.title, code: g.code, status: g.status,
   ownerId: g.ownerId, ownerName: g.ownerName, setup: g.setup || {},
+  scenarioId: g.scenarioId ?? null, scenarioTitle: g.scenarioTitle ?? null,
   createdAt: g.createdAt, updatedAt: g.updatedAt,
 });
+const publicScenario = (s) => ({
+  scenarioId: s.scenarioId, title: s.title, summary: s.summary,
+  ownerId: s.ownerId, ownerName: s.ownerName, createdAt: s.createdAt, updatedAt: s.updatedAt,
+});
+
+/* Structural check of an uploaded cartridge: enough that a game built from it
+   can be assigned and opened. The detailed checks (matrix, moods, injects)
+   run in the browser before upload (src/cartridge.js). */
+function readScenarioBody(event) {
+  const { body } = readJson(event);
+  if (typeof body !== "object" || body === null || Array.isArray(body)) fail(400, "Send the cartridge as { body: { … } }.");
+  if (JSON.stringify(body).length > MAX_SCENARIO_CHARS) fail(413, `The cartridge is larger than ${MAX_SCENARIO_CHARS / 1000} KB.`);
+  const title = typeof body.meta?.title === "string" ? body.meta.title.trim() : "";
+  if (!title || title.length > MAX_SCENARIO_TITLE) fail(400, `The cartridge needs a meta.title (1–${MAX_SCENARIO_TITLE} characters).`);
+  const dels = Array.isArray(body.delegations) ? body.delegations : [];
+  if (dels.length < 2) fail(400, "The cartridge needs at least two delegations.");
+  const ids = dels.map((d) => d?.id);
+  if (ids.some((id) => typeof id !== "string" || !DELEGATION_RE.test(id) || id === "observer") || new Set(ids).size !== ids.length) {
+    fail(400, "Every delegation needs a unique id of letters, digits, - or _.");
+  }
+  if (!Array.isArray(body.issues) || !body.issues.length) fail(400, "The cartridge needs at least one issue.");
+  const summary = {
+    delegations: dels.map((d) => ({ id: d.id, name: String(d.name || d.id).slice(0, 80), flag: String(d.flag || "").slice(0, 16) })),
+    issues: body.issues.length,
+    injects: Array.isArray(body.injects) ? body.injects.length : 0,
+  };
+  return { body, title, summary };
+}
+const delegationIds = (scenario) => new Set((scenario?.delegations || []).map((d) => d.id));
 const publicMember = (m) => ({
   userId: m.userId, name: m.name, email: m.email, role: m.role,
   delegation: m.delegation ?? null, joinedAt: m.joinedAt,
@@ -74,7 +109,7 @@ const normalizeEmail = (email) => String(email || "").trim().toLowerCase();
 
 export function makeHandler(store, { randomWord, rootProfessors = [], now = () => new Date().toISOString(), newId = () => crypto.randomUUID() }) {
   const roots = new Set(rootProfessors.map(normalizeEmail).filter(Boolean));
-  const requireProfessor = (me) => { if (me.role !== "professor") fail(403, "Only professors can manage professors."); };
+  const requireProfessor = (me, what = "manage professors") => { if (me.role !== "professor") fail(403, `Only professors can ${what}.`); };
   /* Load a game the caller belongs to. Non-members get 404, not 403, so game
      ids can't be probed. */
   async function memberGame(me, gameId) {
@@ -91,14 +126,21 @@ export function makeHandler(store, { randomWord, rootProfessors = [], now = () =
   const routes = {
     async "POST /games"(me, event) {
       if (me.role !== "professor") fail(403, "Only professors can start a game.");
-      const { title, setup = {} } = readJson(event);
+      const { title, setup = {}, scenarioId = null } = readJson(event);
       const t = typeof title === "string" ? title.trim() : "";
       if (!t || t.length > MAX_TITLE) fail(400, `Give the game a title (1–${MAX_TITLE} characters).`);
       if (typeof setup !== "object" || setup === null || Array.isArray(setup) || JSON.stringify(setup).length > MAX_SETUP_CHARS) {
         fail(400, "Setup must be a small JSON object.");
       }
+      // No scenarioId: the built-in template, as before scenarios existed.
+      let copy = {};
+      if (scenarioId !== null) {
+        const sc = typeof scenarioId === "string" && await store.getScenario(scenarioId);
+        if (!sc) fail(404, "That scenario isn't in the library anymore. Pick another one.");
+        copy = { scenarioId: sc.scenarioId, scenarioTitle: sc.title, scenario: sc.body };
+      }
       const ts = now();
-      const base = { gameId: newId(), title: t, status: "lobby", ownerId: me.userId, ownerName: me.name, setup, createdAt: ts, updatedAt: ts };
+      const base = { gameId: newId(), title: t, status: "lobby", ownerId: me.userId, ownerName: me.name, setup, ...copy, createdAt: ts, updatedAt: ts };
       const owner = { userId: me.userId, gameId: base.gameId, name: me.name, email: me.email, role: "professor", delegation: null, joinedAt: ts };
       // A taken word just means another active game has it: draw again, then fall back to word+digits.
       for (let attempt = 0; attempt < 12; attempt++) {
@@ -141,7 +183,8 @@ export function makeHandler(store, { randomWord, rootProfessors = [], now = () =
 
     async "GET /games/{gameId}"(me, event) {
       const { game, membership, isOwner } = await memberGame(me, event.pathParameters.gameId);
-      const body = { game: publicGame(game), membership: publicMember(membership) };
+      // The game's own copy of its cartridge (null: the built-in template).
+      const body = { game: publicGame(game), membership: publicMember(membership), scenario: game.scenario ?? null };
       if (isOwner) body.members = (await store.listMembers(game.gameId)).map(publicMember);
       return json(200, body);
     },
@@ -177,6 +220,9 @@ export function makeHandler(store, { randomWord, rootProfessors = [], now = () =
       if (typeof userId !== "string" || !userId) fail(400, "Pick a student.");
       if (userId === game.ownerId) fail(400, "The professor can't take a delegation.");
       if (delegation !== null && (typeof delegation !== "string" || !DELEGATION_RE.test(delegation))) fail(400, "Unknown delegation.");
+      if (delegation !== null && delegation !== "observer" && game.scenario && !delegationIds(game.scenario).has(delegation)) {
+        fail(400, `"${delegation}" isn't a delegation in this game's scenario.`);
+      }
       const member = await store.setDelegation(game.gameId, userId, delegation);
       if (!member) fail(404, "That student hasn't joined this game.");
       return json(200, { member: publicMember(member) });
@@ -193,6 +239,49 @@ export function makeHandler(store, { randomWord, rootProfessors = [], now = () =
         if (e instanceof StaleStatus) fail(409, "The game changed in the meantime. Reload and try again.");
         throw e;
       }
+    },
+
+    async "GET /scenarios"(me) {
+      requireProfessor(me, "use the scenario library");
+      const list = (await store.listScenarios()).map(publicScenario)
+        .sort((a, b) => (b.updatedAt || "").localeCompare(a.updatedAt || ""));
+      return json(200, { scenarios: list });
+    },
+
+    async "GET /scenarios/{scenarioId}"(me, event) {
+      requireProfessor(me, "use the scenario library");
+      const sc = await store.getScenario(event.pathParameters.scenarioId);
+      if (!sc) fail(404, "That scenario isn't in the library anymore.");
+      return json(200, { scenario: publicScenario(sc), body: sc.body });
+    },
+
+    async "POST /scenarios"(me, event) {
+      requireProfessor(me, "upload scenarios");
+      const { body, title, summary } = readScenarioBody(event);
+      const ts = now();
+      const sc = { scenarioId: newId(), title, summary, body, ownerId: me.userId, ownerName: me.name, createdAt: ts, updatedAt: ts };
+      await store.putScenario(sc);
+      return json(201, { scenario: publicScenario(sc) });
+    },
+
+    async "PUT /scenarios/{scenarioId}"(me, event) {
+      requireProfessor(me, "upload scenarios");
+      const prev = await store.getScenario(event.pathParameters.scenarioId);
+      if (!prev) fail(404, "That scenario isn't in the library anymore.");
+      if (prev.ownerId !== me.userId) fail(403, `Only ${prev.ownerName || "the professor who uploaded it"} can replace this scenario. Upload it as a new one instead.`);
+      const { body, title, summary } = readScenarioBody(event);
+      const sc = { ...prev, title, summary, body, updatedAt: now() };
+      await store.putScenario(sc);
+      return json(200, { scenario: publicScenario(sc) });
+    },
+
+    async "DELETE /scenarios/{scenarioId}"(me, event) {
+      requireProfessor(me, "delete scenarios");
+      const prev = await store.getScenario(event.pathParameters.scenarioId);
+      if (!prev) fail(404, "That scenario isn't in the library anymore.");
+      if (prev.ownerId !== me.userId) fail(403, `Only ${prev.ownerName || "the professor who uploaded it"} can delete this scenario.`);
+      await store.deleteScenario(prev.scenarioId);
+      return json(200, { ok: true });
     },
 
     async "GET /professors"(me) {

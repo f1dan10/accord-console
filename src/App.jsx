@@ -5,6 +5,7 @@ import {
 } from "./auth.js";
 import { api } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
+import { normalizeCartridge, designRules, readCartridgeFile, summarize } from "./cartridge.js";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -179,16 +180,16 @@ const GREEN = "#367C60";        // v9: resolved/positive on light grounds (4.66:
 const GREEN_DARK = "#46A07C";   // v9: resolved/positive on dark grounds (4.60:1)
 const PLATE = "#FFFDF8";        // v9: resting control surface
 
-const S = SCENARIO;
+let S;
 /* Draft cap. Cartridges may set mechanics.maxLiveDrafts; when they leave it null
    the engine defaults to 4. Singapore ran uncapped and the table drowned. */
-const MAX_LIVE_DRAFTS = S.mechanics.maxLiveDrafts == null ? 4 : S.mechanics.maxLiveDrafts;
-const TEAMS = S.delegations.map((d) => d.id);
-const N_TEAMS = TEAMS.length;
-const DELEG = Object.fromEntries(S.delegations.map((d) => [d.id, d]));
-const FLAGS = Object.fromEntries(S.delegations.map((d) => [d.id, d.flag]));
-const MEDIATORS = TEAMS.filter((t) => DELEG[t].mediator);
-const MINISTRY = Object.fromEntries(S.delegations.map((d) => [d.id, d.ministry]));
+let MAX_LIVE_DRAFTS;
+let TEAMS;
+let N_TEAMS;
+let DELEG;
+let FLAGS;
+let MEDIATORS;
+let MINISTRY;
 /* Sign-in is by account (auth.js); delegation access codes in older cartridges
    (access / accessHash / viewAccess / facilitatorCode / projectorCode …) are
    ignored. The designer key is still checked against its salted SHA-256 hash,
@@ -200,21 +201,21 @@ async function codeHash(s) {
 }
 /* Designer view: scoring detail is shown only in a browser where the designer
    key was entered once (professor dashboard, Settings). The flag is per browser. */
-const DESIGNER_HASH = S.designerHash || null;
+let DESIGNER_HASH;
 async function readDesigner() {
   try { const r = await window.storage.get("pz-designer", false); return !!(r && r.value === "1"); } catch { return false; }
 }
 
-const MATRIX = JSON.parse(atob(S.matrixB64));
-const ISSUES = S.issues;
+let MATRIX;
+let ISSUES;
 const issueWeight = (iss) => (iss.type === "ranked" ? iss.options.length : (iss.weight ?? 2));
 /* v1.5 — Priority issue. A delegation's `priority` issue (cartridge field on the
    delegation) counts at scoring.priorityWeight (default 2×). Everything else is 1×.
    MAX_SCORE is therefore per-team. */
-const PRIORITY_W = (S.scoring && S.scoring.priorityWeight) || 2;
+let PRIORITY_W;
 const issueWeightFor = (team, iss) => issueWeight(iss) * ((DELEG[team] && DELEG[team].priority === iss.id) ? PRIORITY_W : 1);
 const maxScoreFor = (team) => ISSUES.reduce((s, i) => s + issueWeightFor(team, i), 0);
-const MAX_SCORE = ISSUES.reduce((s, i) => s + issueWeight(i), 0); // legacy: unweighted total
+let MAX_SCORE; // legacy: unweighted total
 /* v1.5 — Per-delegation no-deal value: the deal-score a delegation is treated as
    holding if talks collapse (cartridge `noDealPct` on the delegation, 0–100).
    Replaces the universal collapse-to-zero. */
@@ -223,7 +224,7 @@ const noDealPct = (team) => Math.max(0, Math.min(100, (DELEG[team] && DELEG[team
    mechanics.redLineMode "hard" (default when redLines exist): the delegation
    cannot endorse a package containing its red line; the console says why.
    This replaces the old red-line-as-cheap-concession calibration. */
-const RED_LINE_MODE = (S.mechanics && S.mechanics.redLineMode) || "hard";
+let RED_LINE_MODE;
 function crossedRedLines(team, terms) {
   const rl = (DELEG[team] && DELEG[team].redLines) || {};
   const out = [];
@@ -233,9 +234,9 @@ function crossedRedLines(team, terms) {
   }
   return out;
 }
-const TERM_FIELDS = ISSUES.map((i) => i.id);
+let TERM_FIELDS;
 const complete = (t) => TERM_FIELDS.every((f) => t && t[f] !== null && t[f] !== undefined);
-const EMPTY_TERMS = Object.fromEntries(TERM_FIELDS.map((f) => [f, null]));
+let EMPTY_TERMS;
 const shortLabel = (iss) => iss.short || (iss.label.charAt(0) + iss.label.slice(1).toLowerCase().replace(/\?$/, ""));
 
 /* ---- Deal scoring (generic) ---- */
@@ -264,8 +265,8 @@ function dealPct(team, terms, adopted) {
 function blendedPct(team, terms, adopted, cred) {
   return Math.round(S.scoring.dealWeight * dealPct(team, terms, adopted) + S.scoring.credWeight * (cred ?? S.scoring.startCred));
 }
-const DEAL_W_PCT = Math.round(S.scoring.dealWeight * 100);
-const CRED_W_PCT = Math.round(S.scoring.credWeight * 100);
+let DEAL_W_PCT;
+let CRED_W_PCT;
 
 function termsLabel(t) {
   return ISSUES.map((iss) => {
@@ -276,7 +277,7 @@ function termsLabel(t) {
 }
 
 /* ---- Public diplomacy (from config) ---- */
-const PD = S.publicDiplomacy;
+let PD;
 /* v1.5 — Two-audience model. The international mood (PD.moods) grades every
    filing and, when PD.hideInternationalMood is true, its dispatch is shown only
    on the GM console: players must infer it from the wire and from how rivals'
@@ -284,15 +285,15 @@ const PD = S.publicDiplomacy;
    audience (cartridge delegation.domestic: { label, dispatch, moods }) shown
    only to that delegation. The GM sets each delegation's domestic mood key
    (pub.domestic[team]); the label/description is what the team reads. */
-const HIDE_INTL_MOOD = !!PD.hideInternationalMood;
+let HIDE_INTL_MOOD;
 const domesticOf = (team) => (DELEG[team] && DELEG[team].domestic) || null;
 const domesticMoodText = (team, key) => { const d = domesticOf(team); if (!d) return ""; return (key && d.moods && d.moods[key]) || d.dispatch; };
-const POSTURES = PD.postures;
-const MOODS = PD.moods;
-const DEFAULT_MOOD = PD.defaultMood;
-const TOTAL_WINDOWS = PD.windows.total;
-const WINDOW_MINUTES = PD.windows.minutes;
-const MISSED_FILING_PENALTY = PD.windows.missedPenalty;
+let POSTURES;
+let MOODS;
+let DEFAULT_MOOD;
+let TOTAL_WINDOWS;
+let WINDOW_MINUTES;
+let MISSED_FILING_PENALTY;
 
 function computeNet(sx, posture, moodKey) {
   const m = MOODS[moodKey] || MOODS[DEFAULT_MOOD];
@@ -409,49 +410,16 @@ Respond ONLY with a JSON object, no preamble, no markdown fences: {"e": n, "l": 
 /* v1.5 — Relevance. Off-subject filings earn less and move the target less.
    relFactor: 0→0.25, 1→0.5, 2→0.8, 3→1.0. Applied to net credibility change and
    to sentiment routing. Cartridge may disable with publicDiplomacy.relevance: false. */
-const REL_ON = PD.relevance !== false;
+let REL_ON;
 const relFactor = (sx) => (!REL_ON || sx.rel == null) ? 1 : [0.25, 0.5, 0.8, 1.0][sx.rel];
 
-const INJECT_LIB = S.injects;
+let INJECT_LIB;
 
-/* ---- Scenario integrity checks (design rules from the template spec) ---- */
-function scenarioIntegrity() {
-  const findings = [];
-  TEAMS.forEach((t) => {
-    ISSUES.forEach((iss) => {
-      const v = MATRIX[t] && MATRIX[t][iss.id];
-      if (v == null) findings.push({ level: "hard", text: `Matrix missing: ${t} · ${iss.id}` });
-      else if (iss.type === "ranked" && (!Array.isArray(v) || v.length !== iss.options.length))
-        findings.push({ level: "hard", text: `Matrix malformed: ${t} · ${iss.id}` });
-    });
-  });
-  ISSUES.filter((iss) => iss.type === "ranked").forEach((iss) => {
-    const firsts = {};
-    TEAMS.forEach((t) => {
-      const arr = MATRIX[t] && MATRIX[t][iss.id];
-      if (!Array.isArray(arr)) return;
-      const i = arr.indexOf(1);
-      (firsts[i] = firsts[i] || []).push(t);
-    });
-    Object.entries(firsts).forEach(([i, ts]) => {
-      if (ts.length > 1) findings.push({ level: "advisory", text: `Shared #1 on ${iss.id}: "${iss.options[i]}" (${ts.join(", ")})` });
-    });
-    const n = iss.options.length;
-    if (n >= 3) {
-      const middles = Array.from({ length: n }, (_, i) => i).slice(1, -1);
-      const safe = middles.some((i) => TEAMS.every((t) => {
-        const arr = MATRIX[t] && MATRIX[t][iss.id];
-        return Array.isArray(arr) ? arr[i] !== n : true;
-      }));
-      if (!safe) findings.push({ level: "hard", text: `No safe middle on ${iss.id}: every compromise option is someone's worst` });
-    }
-  });
-  return findings;
-}
-const INTEGRITY = scenarioIntegrity();
+/* Scenario integrity checks: designRules() in cartridge.js. */
+let INTEGRITY;
 
 /* ---- Storage (keys prefixed by scenario id) ---- */
-const P = S.meta.id;
+let P;
 const gmKey = (team) => `${P}-gm-${team}`;
 /* v1.5 — The pinned announcement is the latest real announcement (not a GM log
    line, not after a clear marker) that has not expired. Default life 10 min. */
@@ -463,24 +431,11 @@ function liveAnnouncement(ann, now) {
   if (last.ttlMs != null && now > last.ts + last.ttlMs) return null;
   return last;
 }
-const K = {
-  ann: `${P}-announce`,
-  exemplars: `${P}-exemplars`,
-  clock: `${P}-clock`,
-  props: `${P}-proposals`,
-  endo: `${P}-endorsements`,
-  injects: `${P}-injects`,
-  flags: `${P}-flags`,
-  pub: `${P}-public`,
-  comms: `${P}-communiques`,
-  ai: `${P}-aicontrol`,
-};
+let K;
 
 /* Seat control: per-session map { teamId: "human" | "ai" }.
    Initial state from optional config defaultControl; facilitator toggles govern. */
-const DEFAULT_AI = Object.fromEntries(
-  S.delegations.map((d) => [d.id, d.defaultControl === "ai" ? "ai" : "human"])
-);
+let DEFAULT_AI;
 
 /* A hanging storage bridge must never wedge the UI: every storage call
    races a timeout, and callers fall back gracefully. */
@@ -500,7 +455,7 @@ function withTimeout(p, ms = 5000) {
    - Reads are cached ~1.5s and deduped in flight: a burst of sGets
      (a pull, a host tick) costs one physical get.
    - Writes are read-fresh → mutate → write, serialized per client. */
-const DOC_KEY = `${P}-doc`;
+let DOC_KEY;
 const DOC_CACHE_MS = 1500;
 const WRITE_PROTECT_MS = 8000; // keys we wrote this recently are immune to stale-read reversion
 let docCache = { ts: 0, data: null };
@@ -611,7 +566,7 @@ async function sUpdate(key, fallback, mutate, verify) {
 /* Full clock for the open game: the scenario's deadline, unless the professor
    chose another length when creating the game (setup.minutes). Reassigned by
    setGameDeadline() before a game's room mounts; AI pacing and Reset follow it. */
-let DEFAULT_CLOCK = { running: false, remainingMs: S.meta.deadlineMinutes * 60 * 1000, endsAt: null };
+let DEFAULT_CLOCK;
 function setGameDeadline(minutes) {
   const m = Number(minutes) > 0 ? Number(minutes) : S.meta.deadlineMinutes;
   DEFAULT_CLOCK = { running: false, remainingMs: m * 60 * 1000, endsAt: null };
@@ -661,13 +616,7 @@ async function assertNotPaused() {
   const f = await sGet(K.flags, DEFAULT_FLAGS);
   if (f.paused) throw Object.assign(new Error("paused"), { friendly: "The session is paused by the facilitator." });
 }
-const DEFAULT_PUB = {
-  mood: DEFAULT_MOOD,
-  window: { n: 0, open: false, endsAt: null, penalized: [] },
-  cred: Object.fromEntries(TEAMS.map((t) => [t, S.scoring.startCred])),
-  sentiment: {},
-  domestic: {},   // v1.5: { teamId: domesticMoodKey }
-};
+let DEFAULT_PUB;
 
 async function probeStorage() {
   /* A game's document is the only shared key, and a paused game or an
@@ -835,7 +784,7 @@ async function opEndorse(team, pid, on, gmForce) {
    the same window. The original's applied effects are reversed and the revision's
    applied (scaled by `factor`, 1.0 = full benefit). The original stays in the
    record, marked superseded. */
-const REVISION = PD.revision || null;
+let REVISION;
 async function opFileCommunique(team, { posture, subject, subjectLabel, text, moodKey, revisionOf }) {
   await assertNotPaused();
   const id = `CM-${team}-${Date.now()}`;
@@ -908,7 +857,80 @@ const AI_DEFAULTS = {
   desperationFrac: 0.12, // below this, endorse the best draft if it beats collapse…
   collapseFloor: 0.15,   // …by at least this (anything beats zero)
 };
-const AI_CFG = { ...AI_DEFAULTS, ...(S.mechanics.ai || {}) };
+let AI_CFG;
+
+/* ============ SCENARIO LOADING ============
+   Every value above that is derived from the cartridge is a `let` assigned
+   here. The built-in template is loaded at startup; GameEntry loads a game's
+   own copy (game.scenario) before its room mounts, and the dashboard returns
+   to the template. Engine code reads these values when it runs, so nothing
+   else changes per scenario. Only one game is open per tab. */
+let loadedScenarioKey = null;
+/* key names the cartridge's source ("builtin", "game:<id>", a library entry
+   and version), so polling the same game doesn't rebuild everything. */
+function applyScenario(s, key) {
+  if (key === loadedScenarioKey) return;
+  loadedScenarioKey = key;
+  S = normalizeCartridge(s);
+  MAX_LIVE_DRAFTS = S.mechanics.maxLiveDrafts == null ? 4 : S.mechanics.maxLiveDrafts;
+  TEAMS = S.delegations.map((d) => d.id);
+  N_TEAMS = TEAMS.length;
+  DELEG = Object.fromEntries(S.delegations.map((d) => [d.id, d]));
+  FLAGS = Object.fromEntries(S.delegations.map((d) => [d.id, d.flag]));
+  MEDIATORS = TEAMS.filter((t) => DELEG[t].mediator);
+  MINISTRY = Object.fromEntries(S.delegations.map((d) => [d.id, d.ministry]));
+  DESIGNER_HASH = S.designerHash || null;
+  MATRIX = S.matrix;
+  ISSUES = S.issues;
+  PRIORITY_W = (S.scoring && S.scoring.priorityWeight) || 2;
+  MAX_SCORE = ISSUES.reduce((s, i) => s + issueWeight(i), 0);
+  RED_LINE_MODE = (S.mechanics && S.mechanics.redLineMode) || "hard";
+  TERM_FIELDS = ISSUES.map((i) => i.id);
+  EMPTY_TERMS = Object.fromEntries(TERM_FIELDS.map((f) => [f, null]));
+  DEAL_W_PCT = Math.round(S.scoring.dealWeight * 100);
+  CRED_W_PCT = Math.round(S.scoring.credWeight * 100);
+  PD = S.publicDiplomacy;
+  HIDE_INTL_MOOD = !!PD.hideInternationalMood;
+  POSTURES = PD.postures;
+  MOODS = PD.moods;
+  DEFAULT_MOOD = PD.defaultMood;
+  TOTAL_WINDOWS = PD.windows.total;
+  WINDOW_MINUTES = PD.windows.minutes;
+  MISSED_FILING_PENALTY = PD.windows.missedPenalty;
+  REL_ON = PD.relevance !== false;
+  INJECT_LIB = S.injects;
+  INTEGRITY = designRules(S);
+  P = S.meta.id;
+  K = {
+    ann: `${P}-announce`,
+    exemplars: `${P}-exemplars`,
+    clock: `${P}-clock`,
+    props: `${P}-proposals`,
+    endo: `${P}-endorsements`,
+    injects: `${P}-injects`,
+    flags: `${P}-flags`,
+    pub: `${P}-public`,
+    comms: `${P}-communiques`,
+    ai: `${P}-aicontrol`,
+  };
+  DEFAULT_AI = Object.fromEntries(
+    S.delegations.map((d) => [d.id, d.defaultControl === "ai" ? "ai" : "human"])
+  );
+  DOC_KEY = `${P}-doc`;
+  DEFAULT_CLOCK = { running: false, remainingMs: S.meta.deadlineMinutes * 60 * 1000, endsAt: null };
+  DEFAULT_PUB = {
+    mood: DEFAULT_MOOD,
+    window: { n: 0, open: false, endsAt: null, penalized: [] },
+    cred: Object.fromEntries(TEAMS.map((t) => [t, S.scoring.startCred])),
+    sentiment: {},
+    domestic: {},   // v1.5: { teamId: domesticMoodKey }
+  };
+  REVISION = PD.revision || null;
+  AI_CFG = { ...AI_DEFAULTS, ...(S.mechanics.ai || {}) };
+}
+const BUILTIN = "builtin";
+applyScenario(SCENARIO, BUILTIN);
+
 /* Per-seat capability toggles for AI-controlled delegations. Default: all on.
    The facilitator can restrict a seat to (say) endorse-only mid-session. */
 const AI_CAPS_ALL = { table: true, endorse: true, amend: true, speak: true };
@@ -3417,7 +3439,7 @@ function Login({ onSignedIn }) {
     <div className="min-h-screen flex items-center justify-center p-6" style={{ background: DEEP, fontFamily: BODY_FONT }}>
       <form onSubmit={submit} className="w-full max-w-sm text-center">
         <div className="mb-3"><Wordmark light h="44px" /></div>
-        <div className="text-xs tracking-widest pz-label mb-8" style={{ color: GOLD, fontFamily: MONO_FONT }}>{S.meta.gateTagline}</div>
+        <div className="text-xs tracking-widest pz-label mb-8" style={{ color: GOLD, fontFamily: MONO_FONT }}>ACCORD CONSOLE</div>
         <h1 className="text-lg font-bold mb-4" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>{AUTH_TITLES[mode].toUpperCase()}</h1>
         {info && <div className="mb-4 text-sm" style={{ color: PAPER, opacity: 0.85 }}>{info}</div>}
 
@@ -3478,19 +3500,49 @@ function StatusChip({ status }) {
 const shortDate = (iso) => (iso ? new Date(iso).toLocaleDateString(undefined, { month: "short", day: "numeric" }) : "");
 const projectorUrl = (gameId) => `${location.pathname}?game=${encodeURIComponent(gameId)}&view=projector`;
 
+/* The cartridge a new game will use: the built-in template, or a library entry
+   loaded into the engine (seat toggles, clock default and export import all
+   read the loaded scenario). */
+const BUILTIN_CHOICE = { id: null, key: BUILTIN, title: "Built-in template", cartridge: SCENARIO };
+async function loadLibraryChoice(entry) {
+  const { body } = await api("GET", `/scenarios/${encodeURIComponent(entry.scenarioId)}`);
+  return { id: entry.scenarioId, key: `lib:${entry.scenarioId}@${entry.updatedAt}`, title: entry.title, cartridge: body };
+}
+
 function NewGameForm({ onCreated, onCancel }) {
   const [title, setTitle] = useState("");
-  const [minutes, setMinutes] = useState(String(S.meta.deadlineMinutes));
-  const [seats, setSeats] = useState(DEFAULT_AI);
+  const [library, setLibrary] = useState(null); // scenario metadata, newest first
+  const [choice, setChoice] = useState(null);   // BUILTIN_CHOICE or a loaded library entry
+  const [minutes, setMinutes] = useState("");
+  const [seats, setSeats] = useState({});
   const [fromFile, setFromFile] = useState(null); // { name, doc, summary }
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState("");
+
+  const choose = useCallback(async (entry) => {
+    setErr(""); setFromFile(null);
+    try {
+      const c = entry ? await loadLibraryChoice(entry) : BUILTIN_CHOICE;
+      applyScenario(c.cartridge, c.key);
+      setChoice(c);
+      setMinutes(String(S.meta.deadlineMinutes));
+      setSeats(DEFAULT_AI);
+    } catch (e) { setErr(e.message); }
+  }, []);
+
+  // The newest library scenario is the default; the template when the library is empty.
+  useEffect(() => {
+    api("GET", "/scenarios")
+      .then(({ scenarios }) => { setLibrary(scenarios); return choose(scenarios[0] || null); })
+      .catch((e) => { setLibrary([]); setErr(e.message); choose(null); });
+  }, [choose]);
 
   // Optional: continue from a session export instead of a blank game.
   const pickFile = async (file) => {
     setErr(""); setFromFile(null);
     if (!file) return;
     try {
+      applyScenario(choice.cartridge, choice.key);
       const rec = JSON.parse(await file.text());
       const doc = docFromExport(rec);
       if (rec.seats) setSeats({ ...DEFAULT_AI, ...rec.seats });
@@ -3505,11 +3557,13 @@ function NewGameForm({ onCreated, onCancel }) {
   const create = async () => {
     const t = title.trim();
     const m = Math.round(Number(minutes));
+    if (!choice) return;
     if (!t) { setErr("Give the game a name, e.g. your course and section."); return; }
     if (!(m >= 5 && m <= 300)) { setErr("The clock must be between 5 and 300 minutes."); return; }
     setBusy(true); setErr("");
     try {
-      const { game } = await api("POST", "/games", { title: t, setup: { minutes: m, seats } });
+      applyScenario(choice.cartridge, choice.key);
+      const { game } = await api("POST", "/games", { title: t, scenarioId: choice.id, setup: { minutes: m, seats } });
       /* Seed the new game's state with the chosen seats and clock. If this
          write fails the game still works: the clock follows setup.minutes
          anyway, and seats can be switched in the console. */
@@ -3521,25 +3575,40 @@ function NewGameForm({ onCreated, onCancel }) {
     } catch (e) { setErr(e.message); setBusy(false); }
   };
 
+  const label = (text) => <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>{text}</div>;
   return (
     <div className="rounded p-4 mb-6" style={CARD}>
       <h3 className="font-bold mb-3" style={{ color: PAPER, fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>NEW GAME</h3>
-      <AuthField label="NAME (e.g. course and section)" value={title} maxLength={80} onChange={(e) => setTitle(e.target.value)} />
-      <AuthField label="CLOCK (minutes)" type="number" min={5} max={300} value={minutes} onChange={(e) => setMinutes(e.target.value)} />
-      <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>SEATS (you can switch these during play)</div>
-      <div className="grid gap-2 mb-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
-        {TEAMS.map((t) => (
-          <SeatToggle key={t} team={t} value={seats[t]} onToggle={() => setSeats((s) => ({ ...s, [t]: s[t] === "ai" ? "human" : "ai" }))} />
-        ))}
-      </div>
-      <div className="text-xs pz-label mb-1" style={{ color: GOLD, fontFamily: MONO_FONT, letterSpacing: "0.08em" }}>CONTINUE FROM A SAVED EXPORT (optional)</div>
-      <div className="mb-4 text-sm">
-        <input type="file" accept="application/json,.json" aria-label="Session export file"
-          onChange={(e) => pickFile(e.target.files && e.target.files[0])} style={{ color: PAPER }} />
-        {fromFile && <div className="mt-2" style={{ color: GOLD }}>{fromFile.name}: {fromFile.summary}</div>}
-      </div>
+      <label className="block mb-3">
+        {label("SCENARIO")}
+        <select value={choice ? choice.id || "" : ""} disabled={!library || busy}
+          onChange={(e) => choose(library.find((x) => x.scenarioId === e.target.value) || null)}
+          className="w-full px-3 py-3 rounded" style={AUTH_INPUT}>
+          {(library || []).map((x) => <option key={x.scenarioId} value={x.scenarioId}>{x.title}</option>)}
+          <option value="">{BUILTIN_CHOICE.title}</option>
+        </select>
+        {library && library.length === 0 && (
+          <span className="block mt-1 text-xs" style={{ opacity: 0.7 }}>Upload a cartridge under <b>Scenarios</b> below to run your own case.</span>
+        )}
+      </label>
+      {!choice ? <div className="text-sm mb-4" style={{ opacity: 0.7 }}>Loading scenarios…</div> : <>
+        <AuthField label="NAME (e.g. course and section)" value={title} maxLength={80} onChange={(e) => setTitle(e.target.value)} />
+        <AuthField label="CLOCK (minutes)" type="number" min={5} max={300} value={minutes} onChange={(e) => setMinutes(e.target.value)} />
+        {label("SEATS (you can switch these during play)")}
+        <div className="grid gap-2 mb-4" style={{ gridTemplateColumns: "repeat(auto-fill, minmax(220px, 1fr))" }}>
+          {TEAMS.map((t) => (
+            <SeatToggle key={t} team={t} value={seats[t]} onToggle={() => setSeats((s) => ({ ...s, [t]: s[t] === "ai" ? "human" : "ai" }))} />
+          ))}
+        </div>
+        {label("CONTINUE FROM A SAVED EXPORT (optional)")}
+        <div className="mb-4 text-sm">
+          <input type="file" accept="application/json,.json" aria-label="Session export file"
+            onChange={(e) => pickFile(e.target.files && e.target.files[0])} style={{ color: PAPER }} />
+          {fromFile && <div className="mt-2" style={{ color: GOLD }}>{fromFile.name}: {fromFile.summary}</div>}
+        </div>
+      </>}
       <div className="flex gap-2 flex-wrap">
-        <button onClick={create} disabled={busy} aria-busy={busy ? "true" : "false"} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>Create game</button>
+        <button onClick={create} disabled={busy || !choice} aria-busy={busy ? "true" : "false"} className="px-4 py-2 rounded font-bold" style={BTN_PRIMARY}>Create game</button>
         <button onClick={onCancel} disabled={busy} className="px-4 py-2 rounded" style={BTN_SECONDARY}>Cancel</button>
       </div>
       {err && <div className="mt-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
@@ -3627,7 +3696,7 @@ function ProfessorGames() {
                 <StatusChip status={g.status} />
               </div>
               <div className="text-xs" style={{ opacity: 0.7, fontFamily: MONO_FONT }}>
-                {g.status !== "completed" && <>CODE <span style={{ color: GOLD }}>{g.code.toUpperCase()}</span> · </>}
+                {g.scenarioTitle || BUILTIN_CHOICE.title} · {g.status !== "completed" && <>CODE <span style={{ color: GOLD }}>{g.code.toUpperCase()}</span> · </>}
                 created {shortDate(g.createdAt)}{g.updatedAt !== g.createdAt && <> · updated {shortDate(g.updatedAt)}</>}
               </div>
             </div>
@@ -3709,7 +3778,7 @@ function StudentGames() {
                 <StatusChip status={g.status} />
               </div>
               <div className="text-xs" style={{ opacity: 0.7, fontFamily: MONO_FONT }}>
-                {g.ownerName} · {seatLabel(g.membership.delegation)} · joined {shortDate(g.membership.joinedAt)}
+                {g.ownerName} · {g.scenarioTitle || BUILTIN_CHOICE.title} · {seatLabel(g.membership.delegation)} · joined {shortDate(g.membership.joinedAt)}
               </div>
             </div>
             {(g.status === "live" || g.status === "lobby") && (
@@ -3758,6 +3827,153 @@ function DesignerSetting() {
               <button onClick={enable} className="px-3 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>Turn on</button>
             </div>}
         {msg && <div className="mt-2 text-sm" role="alert" style={{ color: "#ff8a70" }}>{msg}</div>}
+      </div>
+    </details>
+  );
+}
+
+/* Scenario library: cartridges uploaded by professors, shared by all of them.
+   A file is parsed and checked in the browser (cartridge.js) and previewed
+   before it is saved; hard findings block saving. Only the uploader replaces
+   or deletes an entry. Games keep their own copy, so neither touches a game. */
+function downloadJson(name, obj) {
+  const url = URL.createObjectURL(new Blob([JSON.stringify(obj, null, 2)], { type: "application/json" }));
+  const a = Object.assign(document.createElement("a"), { href: url, download: name });
+  document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1000);
+}
+const fileSafe = (s) => String(s || "scenario").replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 60);
+
+function CartridgePreview({ pending, onSave, onCancel, busy }) {
+  const { cartridge: c, findings, fileName, replacing } = pending;
+  const hard = findings.filter((f) => f.level === "hard");
+  const advisory = findings.filter((f) => f.level === "advisory");
+  return (
+    <div className="mb-4 p-3 rounded" style={{ border: `1px solid ${hard.length ? "#ff8a70" : GOLD}` }}>
+      <div className="text-xs mb-1" style={{ opacity: 0.7, fontFamily: MONO_FONT }}>{fileName}{replacing && <> · replaces “{replacing.title}”</>}</div>
+      {c.meta?.title && <div className="font-bold mb-1" style={{ fontFamily: BODY_HI }}>{c.meta.title}</div>}
+      {!hard.length && <>
+        <div className="mb-2 text-xs" style={{ opacity: 0.8 }}>{summarize(c).text} · {c.meta.deadlineMinutes} min clock</div>
+        <div className="mb-2">{c.delegations.map((d) => <span key={d.id} className="inline-block mr-3">{d.flag} {d.name}{d.mediator ? " (mediator)" : ""}</span>)}</div>
+        <details className="mb-2 text-xs">
+          <summary className="cursor-pointer" style={{ opacity: 0.8 }}>Issues and injects</summary>
+          <div className="mt-2" style={{ opacity: 0.85 }}>
+            <div className="mb-1"><b>Issues:</b> {c.issues.map((i) => i.short || i.label).join(" · ")}</div>
+            <div><b>Injects:</b> {c.injects.length ? c.injects.map((j) => `${j.id} ${j.title}`).join(" · ") : "none"}</div>
+          </div>
+        </details>
+      </>}
+      {hard.length > 0 && (
+        <div className="mb-2" role="alert" style={{ color: "#ff8a70" }}>
+          <div className="font-bold mb-1">Fix {hard.length === 1 ? "this" : `these ${hard.length} problems`} in the file, then upload it again:</div>
+          <ul className="list-disc pl-5">{hard.slice(0, 12).map((f, i) => <li key={i}>{f.text}</li>)}</ul>
+          {hard.length > 12 && <div>…and {hard.length - 12} more.</div>}
+        </div>
+      )}
+      {advisory.length > 0 && (
+        <details className="mb-2 text-xs">
+          <summary className="cursor-pointer" style={{ color: "#a07800" }}>{advisory.length} design note{advisory.length === 1 ? "" : "s"} (won't stop the game)</summary>
+          <ul className="list-disc pl-5 mt-1" style={{ opacity: 0.85 }}>{advisory.map((f, i) => <li key={i}>{f.text}</li>)}</ul>
+        </details>
+      )}
+      <div className="flex gap-2 flex-wrap">
+        {!hard.length && (
+          <button onClick={onSave} disabled={busy} aria-busy={busy ? "true" : "false"} className="px-3 py-2 rounded font-bold text-sm" style={BTN_PRIMARY}>
+            {replacing ? "Replace in library" : "Save to library"}
+          </button>
+        )}
+        <button onClick={onCancel} disabled={busy} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Cancel</button>
+      </div>
+    </div>
+  );
+}
+
+function ScenarioLibrary({ me }) {
+  const [list, setList] = useState(null);
+  const [pending, setPending] = useState(null); // { cartridge, findings, fileName, replacing? }
+  const [busy, setBusy] = useState("");
+  const [err, setErr] = useState("");
+  const [done, setDone] = useState("");
+
+  const load = useCallback(async () => {
+    try { setList((await api("GET", "/scenarios")).scenarios); setErr(""); }
+    catch (e) { setErr(e.message); }
+  }, []);
+  useEffect(() => { load(); }, [load]);
+
+  const pick = async (file, replacing = null) => {
+    setErr(""); setDone(""); setPending(null);
+    if (!file) return;
+    try { setPending({ ...(await readCartridgeFile(file)), fileName: file.name, replacing }); }
+    catch (e) { setErr(`${file.name}: ${e.message}`); }
+  };
+  const fileInput = (onFile, labelText, primary) => (
+    <label className="px-3 py-2 rounded text-sm cursor-pointer inline-block" style={primary ? { ...BTN_PRIMARY, fontWeight: 700 } : BTN_SECONDARY}>
+      {labelText}
+      <input type="file" accept=".js,.json,application/json,text/javascript" className="hidden" style={{ display: "none" }}
+        onChange={(e) => { const f = e.target.files && e.target.files[0]; e.target.value = ""; onFile(f); }} />
+    </label>
+  );
+
+  const save = async () => {
+    setBusy("save"); setErr("");
+    try {
+      const r = pending.replacing
+        ? await api("PUT", `/scenarios/${encodeURIComponent(pending.replacing.scenarioId)}`, { body: pending.cartridge })
+        : await api("POST", "/scenarios", { body: pending.cartridge });
+      setDone(`“${r.scenario.title}” is ${pending.replacing ? "updated" : "in the library"}. Choose it under New game.${pending.replacing ? " Games already created keep the version they started with." : ""}`);
+      setPending(null);
+      load();
+    } catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  const download = async (x) => {
+    setBusy(x.scenarioId); setErr("");
+    try { const { body } = await api("GET", `/scenarios/${encodeURIComponent(x.scenarioId)}`); downloadJson(`${fileSafe(body.meta?.id || x.title)}.json`, body); }
+    catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  const remove = async (x) => {
+    if (!window.confirm(`Delete “${x.title}” from the library? Games already created from it keep working.`)) return;
+    setBusy(x.scenarioId); setErr(""); setDone("");
+    try { await api("DELETE", `/scenarios/${encodeURIComponent(x.scenarioId)}`); load(); }
+    catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+
+  return (
+    <details className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a" }}>
+      <summary className="cursor-pointer" style={{ opacity: 0.8 }}>Scenarios (upload a cartridge)</summary>
+      <div className="mt-3 rounded p-4" style={CARD}>
+        <div className="flex items-center gap-3 flex-wrap mb-3">
+          {fileInput((f) => pick(f), "Upload cartridge", true)}
+          <button onClick={() => downloadJson("template.json", normalizeCartridge(SCENARIO))} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Download template</button>
+          <span className="text-xs" style={{ opacity: 0.7 }}>A .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you upload.</span>
+        </div>
+        {pending && <CartridgePreview pending={pending} busy={busy === "save"} onSave={save} onCancel={() => setPending(null)} />}
+        {done && <div className="mb-3 p-3 rounded" role="status" style={{ border: `1px solid ${GOLD}` }}>{done}</div>}
+        {err && <div className="mb-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
+        {list === null && !err && <div style={{ opacity: 0.7 }}>Loading…</div>}
+        {list && list.length === 0 && <div style={{ opacity: 0.75 }}>No scenarios yet. Upload a cartridge to start games from it.</div>}
+        <div className="flex flex-col gap-3">
+          {(list || []).map((x) => {
+            const mine = x.ownerId === me.userId;
+            return (
+              <div key={x.scenarioId} className="flex items-center gap-2 flex-wrap">
+                <div className="flex-1" style={{ minWidth: 200 }}>
+                  <div className="font-bold" style={{ fontFamily: BODY_HI }}>{x.title}</div>
+                  <div className="text-xs" style={{ opacity: 0.7 }}>
+                    {(x.summary?.delegations || []).map((d) => d.flag).join(" ")} {x.summary?.delegations?.length} delegations · {x.summary?.issues} issues · {x.summary?.injects} injects
+                    {" · "}{mine ? "uploaded by you" : `by ${x.ownerName}`} {shortDate(x.updatedAt)}
+                  </div>
+                </div>
+                <button onClick={() => download(x)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Download</button>
+                {mine && fileInput((f) => pick(f, x), "Replace", false)}
+                {mine && <button onClick={() => remove(x)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Delete</button>}
+              </div>
+            );
+          })}
+        </div>
       </div>
     </details>
   );
@@ -3886,6 +4102,7 @@ function AccountHome({ user, notice, onDismiss }) {
           </div>
         )}
         {prof ? <ProfessorGames /> : <StudentGames />}
+        {prof && <ScenarioLibrary me={user} />}
         {prof && <ProfessorsPanel me={user} />}
         {prof && DESIGNER_HASH && <DesignerSetting />}
       </div>
@@ -3929,8 +4146,11 @@ function GameEntry({ gameId, view, onLeave }) {
     let alive = true, timer = null, inRoom = false;
     const load = async () => {
       try {
-        const { game, membership } = await api("GET", `/games/${encodeURIComponent(gameId)}`);
+        const { game, membership, scenario } = await api("GET", `/games/${encodeURIComponent(gameId)}`);
         if (!alive) return;
+        // The game's own cartridge copy; games from before the library run the built-in template.
+        if (scenario) applyScenario(scenario, `game:${gameId}`);
+        else applyScenario(SCENARIO, BUILTIN);
         const owner = game.ownerId === membership.userId;
         // A student who was playing when the professor paused or ended goes home with a notice.
         if (!owner && inRoom && (game.status === "paused" || game.status === "completed")) {
@@ -3974,7 +4194,7 @@ function GameEntry({ gameId, view, onLeave }) {
   }, [gameId, view]);
 
   // Leaving the game (or switching to another) detaches storage from it.
-  useEffect(() => () => { setActiveGame(null); resetDocState(); setGameDeadline(null); }, [gameId]);
+  useEffect(() => () => { setActiveGame(null); resetDocState(); applyScenario(SCENARIO, BUILTIN); setGameDeadline(null); }, [gameId]);
 
   if (state.phase === "loading") return <GameMessage message="Opening the game…" />;
   if (state.phase === "error") return <GameMessage title="Can't open this game" message={state.message} onLeave={onLeave} />;

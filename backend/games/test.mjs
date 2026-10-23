@@ -6,25 +6,30 @@ import { makeHandler, CodeTaken, StaleStatus } from "./app.mjs";
 import { WORDS } from "./words.mjs";
 
 function memoryStore() {
-  const games = new Map(), docs = new Map(), members = new Map(), codes = new Map(), professors = new Map();
+  const games = new Map(), docs = new Map(), members = new Map(), codes = new Map(), professors = new Map(), scenarios = new Map();
   const mk = (u, g) => `${u}|${g}`;
   return {
-    games, codes, professors,
+    games, codes, professors, scenarios,
+    // Like db.mjs: stored copies are independent of the caller's objects, and listings carry no bodies.
+    async listScenarios() { return [...scenarios.values()].map(({ body, ...meta }) => meta); },
+    async getScenario(id) { const sc = scenarios.get(id); return sc ? structuredClone(sc) : null; },
+    async putScenario(sc) { scenarios.set(sc.scenarioId, structuredClone(sc)); },
+    async deleteScenario(id) { scenarios.delete(id); },
     async listProfessors() { return [...professors.values()]; },
     async addProfessor(row) {
       if (professors.has(row.email)) return professors.get(row.email);
       professors.set(row.email, { ...row }); return null;
     },
     async removeProfessor(email) { return professors.delete(email); },
-    async getGame(id) { return games.get(id) || null; },
+    async getGame(id) { const g = games.get(id); return g ? structuredClone(g) : null; },
     async getMember(u, g) { return members.get(mk(u, g)) || null; },
     async listMembers(g) { return [...members.values()].filter((m) => m.gameId === g); },
     async listMemberships(u) { return [...members.values()].filter((m) => m.userId === u); },
-    async getGames(ids) { return ids.map((id) => games.get(id)).filter(Boolean); },
+    async getGames(ids) { return ids.map((id) => games.get(id)).filter(Boolean).map(({ scenario, ...g }) => g); },
     async lookupCode(c) { return codes.get(c) || null; },
     async createGame(game, owner) {
       if (codes.has(game.code)) throw new CodeTaken();
-      codes.set(game.code, game.gameId); games.set(game.gameId, { ...game });
+      codes.set(game.code, game.gameId); games.set(game.gameId, structuredClone(game));
       docs.set(game.gameId, { version: 0 }); members.set(mk(owner.userId, game.gameId), { ...owner });
     },
     async joinAsStudent({ userId, gameId, name, email, joinedAt }) {
@@ -58,10 +63,10 @@ function setup(words = ["southern", "maple"]) {
     now: () => new Date(Date.UTC(2026, 9, 15) + ++clock * 1000).toISOString(),
     newId: () => `game-${++id}`,
   });
-  const as = (user) => async (routeKey, { gameId, email, body, raw } = {}) => {
+  const as = (user) => async (routeKey, { gameId, email, scenarioId, body, raw } = {}) => {
     const r = await handler({
       routeKey,
-      pathParameters: gameId ? { gameId } : email ? { email } : undefined,
+      pathParameters: gameId ? { gameId } : email ? { email } : scenarioId ? { scenarioId } : undefined,
       body: raw ?? (body === undefined ? undefined : JSON.stringify(body)),
       requestContext: { authorizer: { jwt: { claims: { token_use: "id", ...user } } } },
     });
@@ -197,4 +202,86 @@ test("professors invite and revoke professors; bootstrap and self are protected"
   assert.equal((await t.profX("DELETE /professors/{email}", { email: "nobody@mit.edu" })).status, 404);
   assert.equal((await t.profY("DELETE /professors/{email}", { email: "New.Prof%40mit.edu" })).status, 200);
   assert.deepEqual((await list()).map((p) => p.email), ["x@mit.edu", "y@mit.edu"]);
+});
+
+const cartridge = (title = "Islamabad", ids = ["USA", "Iran"]) => ({
+  meta: { id: "ind26", title, deadlineMinutes: 90 },
+  delegations: ids.map((id) => ({ id, name: id, flag: "🏳️" })),
+  issues: [{ id: "length", label: "LENGTH", type: "ranked", options: ["10", "15"] }],
+  matrix: Object.fromEntries(ids.map((id) => [id, { length: [1, 2] }])),
+  injects: [{ id: "L1", title: "Flash", body: "News." }],
+});
+
+test("scenario library: professors share it, only the uploader replaces or deletes", async () => {
+  const t = setup();
+  assert.equal((await t.alice("GET /scenarios")).status, 403);
+  assert.equal((await t.alice("POST /scenarios", { body: { body: cartridge() } })).status, 403);
+
+  // Structural checks.
+  for (const bad of [undefined, [], { meta: {} }, { ...cartridge(), delegations: [{ id: "USA" }] },
+    { ...cartridge(), delegations: [{ id: "US A" }, { id: "Iran" }] }, { ...cartridge(), delegations: [{ id: "observer" }, { id: "Iran" }] },
+    { ...cartridge(), delegations: [{ id: "USA" }, { id: "USA" }] }, { ...cartridge(), issues: [] }]) {
+    assert.equal((await t.profX("POST /scenarios", { body: { body: bad } })).status, 400, JSON.stringify(bad));
+  }
+  const huge = cartridge();
+  huge.injects = [{ id: "big", title: "x", body: "x".repeat(210_000) }];
+  assert.equal((await t.profX("POST /scenarios", { body: { body: huge } })).status, 413);
+
+  const up = await t.profX("POST /scenarios", { body: { body: cartridge() } });
+  assert.equal(up.status, 201);
+  const id = up.body.scenario.scenarioId;
+  assert.deepEqual(up.body.scenario.summary, { delegations: [{ id: "USA", name: "USA", flag: "🏳️" }, { id: "Iran", name: "Iran", flag: "🏳️" }], issues: 1, injects: 1 });
+
+  // Any professor lists and reads it; listings have no bodies.
+  const list = (await t.profY("GET /scenarios")).body.scenarios;
+  assert.equal(list.length, 1);
+  assert.equal(list[0].ownerName, "Prof X");
+  assert.equal(list[0].body, undefined);
+  assert.equal((await t.profY("GET /scenarios/{scenarioId}", { scenarioId: id })).body.body.meta.title, "Islamabad");
+  assert.equal((await t.profY("GET /scenarios/{scenarioId}", { scenarioId: "nope" })).status, 404);
+
+  // Only the owner replaces or deletes.
+  assert.equal((await t.profY("PUT /scenarios/{scenarioId}", { scenarioId: id, body: { body: cartridge("Hijack") } })).status, 403);
+  assert.equal((await t.profY("DELETE /scenarios/{scenarioId}", { scenarioId: id })).status, 403);
+  const re = await t.profX("PUT /scenarios/{scenarioId}", { scenarioId: id, body: { body: cartridge("Islamabad v2") } });
+  assert.equal(re.status, 200);
+  assert.equal(re.body.scenario.title, "Islamabad v2");
+  assert.equal(re.body.scenario.createdAt, up.body.scenario.createdAt);
+  assert.equal((await t.profX("DELETE /scenarios/{scenarioId}", { scenarioId: id })).status, 200);
+  assert.deepEqual((await t.profX("GET /scenarios")).body.scenarios, []);
+});
+
+test("a game keeps its own copy of the scenario it was created from", async () => {
+  const t = setup();
+  const id = (await t.profX("POST /scenarios", { body: { body: cartridge("Islamabad", ["USA", "Iran", "E3"]) } })).body.scenario.scenarioId;
+  assert.equal((await t.profX("POST /games", { body: { title: "Class", scenarioId: "missing" } })).status, 404);
+  const created = await t.profY("POST /games", { body: { title: "Class B", scenarioId: id } });
+  assert.equal(created.status, 201, "any professor can start a game from the shared library");
+  const g = created.body.game;
+  assert.equal(g.scenarioId, id);
+  assert.equal(g.scenarioTitle, "Islamabad");
+
+  // Members get the copy; listings don't carry it.
+  await t.alice("POST /games/join", { body: { code: g.code } });
+  assert.deepEqual((await t.alice("GET /games/{gameId}", { gameId: g.gameId })).body.scenario.delegations.map((d) => d.id), ["USA", "Iran", "E3"]);
+  const listed = (await t.profY("GET /games")).body.games[0];
+  assert.equal(listed.scenarioTitle, "Islamabad");
+  assert.equal(listed.scenario, undefined);
+
+  // Replacing or deleting the library entry doesn't touch the game.
+  await t.profX("PUT /scenarios/{scenarioId}", { scenarioId: id, body: { body: cartridge("Changed", ["A1", "B1"]) } });
+  await t.profX("DELETE /scenarios/{scenarioId}", { scenarioId: id });
+  const after = (await t.profY("GET /games/{gameId}", { gameId: g.gameId })).body;
+  assert.equal(after.scenario.meta.title, "Islamabad");
+  assert.equal(after.game.scenarioTitle, "Islamabad");
+
+  // Assignments must be one of this game's delegations (or observer).
+  assert.equal((await t.profY("POST /games/{gameId}/assign", { gameId: g.gameId, body: { userId: "sa", delegation: "Alpha" } })).status, 400);
+  assert.equal((await t.profY("POST /games/{gameId}/assign", { gameId: g.gameId, body: { userId: "sa", delegation: "E3" } })).status, 200);
+  assert.equal((await t.profY("POST /games/{gameId}/assign", { gameId: g.gameId, body: { userId: "sa", delegation: "observer" } })).status, 200);
+
+  // A game without a scenario is the built-in template: no copy, any valid id assignable.
+  const tmpl = (await t.profX("POST /games", { body: { title: "Template" } })).body.game;
+  assert.equal(tmpl.scenarioId, null);
+  assert.equal((await t.profX("GET /games/{gameId}", { gameId: tmpl.gameId })).body.scenario, null);
 });

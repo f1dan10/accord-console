@@ -180,6 +180,16 @@ Resources:
       KeySchema:
         - { AttributeName: email, KeyType: HASH }
 
+  # Scenario library (uploaded cartridges, body gzipped). Games keep their own copy.
+  ScenariosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: scenarioId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: scenarioId, KeyType: HASH }
+
   GamesFunction:
     Type: AWS::Serverless::Function
     Properties:
@@ -193,6 +203,7 @@ Resources:
           MEMBERS_TABLE: !Ref MembersTable
           CODES_TABLE: !Ref CodesTable
           PROFESSORS_TABLE: !Ref ProfessorsTable
+          SCENARIOS_TABLE: !Ref ScenariosTable
           PROFESSOR_EMAILS: !Ref ProfessorEmails
       Policies:
         - DynamoDBCrudPolicy: { TableName: !Ref GamesTable }
@@ -200,7 +211,48 @@ Resources:
         - DynamoDBCrudPolicy: { TableName: !Ref MembersTable }
         - DynamoDBCrudPolicy: { TableName: !Ref CodesTable }
         - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ScenariosTable }
       Events:
+        ListScenarios:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        CreateScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        GetScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        ReplaceScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoJwt
+        DeleteScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoJwt
         ListProfessors:
           Type: HttpApi
           Properties:
