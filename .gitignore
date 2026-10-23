@@ -27,3 +27,6 @@ dist-ssr
 .env.local
 .aws-sam/
 samconfig.toml
+
+# Claude Code local settings and launch config
+.claude/
