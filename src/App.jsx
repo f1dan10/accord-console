@@ -5,7 +5,8 @@ import {
 } from "./auth.js";
 import { api } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
-import { normalizeCartridge, designRules, readCartridgeFile, summarize } from "./cartridge.js";
+import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge } from "./cartridge.js";
+import ScenarioEditor from "./ScenarioEditor.jsx";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -3844,7 +3845,7 @@ function downloadJson(name, obj) {
 }
 const fileSafe = (s) => String(s || "scenario").replace(/[^A-Za-z0-9_-]+/g, "-").slice(0, 60);
 
-function CartridgePreview({ pending, onSave, onCancel, busy }) {
+function CartridgePreview({ pending, onSave, onEdit, onCancel, busy }) {
   const { cartridge: c, findings, fileName, replacing } = pending;
   const hard = findings.filter((f) => f.level === "hard");
   const advisory = findings.filter((f) => f.level === "advisory");
@@ -3882,14 +3883,18 @@ function CartridgePreview({ pending, onSave, onCancel, busy }) {
             {replacing ? "Replace in library" : "Save to library"}
           </button>
         )}
+        <button onClick={onEdit} disabled={busy} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>{hard.length ? "Fix in editor" : "Open in editor"}</button>
         <button onClick={onCancel} disabled={busy} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Cancel</button>
       </div>
     </div>
   );
 }
 
+const EDITOR_UI = { GOLD, PAPER, CARD, BTN_PRIMARY, BTN_SECONDARY, INPUT: AUTH_INPUT, MONO_FONT, HEAD_FONT, BODY_HI };
+
 function ScenarioLibrary({ me }) {
   const [list, setList] = useState(null);
+  const [editing, setEditing] = useState(null); // { initial, replacing }
   const [pending, setPending] = useState(null); // { cartridge, findings, fileName, replacing? }
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -3933,6 +3938,23 @@ function ScenarioLibrary({ me }) {
     catch (e) { setErr(e.message); }
     setBusy("");
   };
+  // Edit your own entry in place, or start from a copy of anyone's.
+  const openEditor = async (x, asCopy) => {
+    setBusy(x.scenarioId); setErr(""); setDone(""); setPending(null);
+    try {
+      const { body } = await api("GET", `/scenarios/${encodeURIComponent(x.scenarioId)}`);
+      const initial = normalizeCartridge(body);
+      if (asCopy) initial.meta = { ...initial.meta, title: `COPY OF ${initial.meta.title}` };
+      setEditing({ initial, replacing: asCopy ? null : x });
+    } catch (e) { setErr(e.message); }
+    setBusy("");
+  };
+  const saved = (sc, replaced) => {
+    setEditing(null);
+    setDone(`“${sc.title}” is ${replaced ? "updated" : "in the library"}. Choose it under New game.${replaced ? " Games already created keep the version they started with." : ""}`);
+    load();
+  };
+
   const remove = async (x) => {
     if (!window.confirm(`Delete “${x.title}” from the library? Games already created from it keep working.`)) return;
     setBusy(x.scenarioId); setErr(""); setDone("");
@@ -3945,12 +3967,19 @@ function ScenarioLibrary({ me }) {
     <details className="mt-10 pt-4 text-sm" style={{ borderTop: "1px solid #34393a" }}>
       <summary className="cursor-pointer" style={{ opacity: 0.8 }}>Scenarios (upload a cartridge)</summary>
       <div className="mt-3 rounded p-4" style={CARD}>
+        {editing ? (
+          <ScenarioEditor key={editing.replacing?.scenarioId || "new"} initial={editing.initial} replacing={editing.replacing} ui={EDITOR_UI}
+            onSaved={saved} onCancel={() => setEditing(null)} />
+        ) : <>
         <div className="flex items-center gap-3 flex-wrap mb-3">
-          {fileInput((f) => pick(f), "Upload cartridge", true)}
+          <button onClick={() => { setDone(""); setPending(null); setEditing({ initial: blankCartridge(SCENARIO), replacing: null }); }}
+            className="px-3 py-2 rounded text-sm font-bold" style={BTN_PRIMARY}>New scenario</button>
+          {fileInput((f) => pick(f), "Upload cartridge", false)}
           <button onClick={() => downloadJson("template.json", normalizeCartridge(SCENARIO))} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Download template</button>
-          <span className="text-xs" style={{ opacity: 0.7 }}>A .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you upload.</span>
+          <span className="text-xs" style={{ opacity: 0.7 }}>Build one in the editor, or upload a .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you save.</span>
         </div>
-        {pending && <CartridgePreview pending={pending} busy={busy === "save"} onSave={save} onCancel={() => setPending(null)} />}
+        {pending && <CartridgePreview pending={pending} busy={busy === "save"} onSave={save} onCancel={() => setPending(null)}
+          onEdit={() => { setEditing({ initial: pending.cartridge, replacing: pending.replacing }); setPending(null); }} />}
         {done && <div className="mb-3 p-3 rounded" role="status" style={{ border: `1px solid ${GOLD}` }}>{done}</div>}
         {err && <div className="mb-3 text-sm" role="alert" style={{ color: "#ff8a70" }}>{err}</div>}
         {list === null && !err && <div style={{ opacity: 0.7 }}>Loading…</div>}
@@ -3967,6 +3996,8 @@ function ScenarioLibrary({ me }) {
                     {" · "}{mine ? "uploaded by you" : `by ${x.ownerName}`} {shortDate(x.updatedAt)}
                   </div>
                 </div>
+                {mine && <button onClick={() => openEditor(x, false)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Edit</button>}
+                <button onClick={() => openEditor(x, true)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Copy</button>
                 <button onClick={() => download(x)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Download</button>
                 {mine && fileInput((f) => pick(f, x), "Replace", false)}
                 {mine && <button onClick={() => remove(x)} disabled={busy === x.scenarioId} className="px-2 py-1 rounded text-xs" style={BTN_SECONDARY}>Delete</button>}
@@ -3974,6 +4005,7 @@ function ScenarioLibrary({ me }) {
             );
           })}
         </div>
+        </>}
       </div>
     </details>
   );

@@ -338,3 +338,244 @@ export async function readCartridgeFile(file) {
   const cartridge = normalizeCartridge(raw);
   return { cartridge, findings: checkCartridge(cartridge) };
 }
+
+/* ---- editing ----
+   Pure helpers for the scenario editor. Each takes a normalized cartridge and
+   returns a new one, keeping every reference consistent: the rank matrix,
+   delegation priorities and red lines, and moods used by injects. Option
+   indices are what the matrix and red lines store, so adding, removing or
+   moving an option rewrites them. */
+
+const clone = (s) => structuredClone(s);
+const uniqueId = (base, taken) => {
+  let n = 1;
+  while (taken.has(`${base}${n}`)) n++;
+  return `${base}${n}`;
+};
+/* Default matrix cell: options ranked in listed order, or the first option required. */
+const defaultCell = (iss) => (iss.type === "ranked" ? iss.options.map((_, i) => i + 1) : 0);
+// Ranks 1..n in the same relative order, e.g. [4, 1, 3] -> [3, 1, 2].
+const rerank = (ranks) => {
+  const order = ranks.map((r, i) => [r, i]).sort((a, b) => a[0] - b[0]);
+  const out = [];
+  order.forEach(([, i], k) => { out[i] = k + 1; });
+  return out;
+};
+
+export function blankCartridge(template) {
+  const s = normalizeCartridge(template);
+  s.meta = { ...s.meta, id: `sc${Date.now().toString(36).slice(-6)}`, title: "NEW SCENARIO", gateTagline: "NEW SCENARIO", projectorSubtitle: "NEW SCENARIO" };
+  return s;
+}
+
+export function addDelegation(s0) {
+  const s = clone(s0);
+  const id = uniqueId("Delegation", new Set(s.delegations.map((d) => d.id)));
+  s.delegations.push({
+    id, name: id, flag: "🏳️", mediator: false,
+    ministry: { wire: `${id.toUpperCase()} — FOREIGN MINISTRY`, title: "Foreign Ministry", speaker: `The Foreign Ministry of ${id}` },
+    priority: null, noDealPct: 30, redLines: {},
+    domestic: { label: `${id} public`, dispatch: "", moods: {} },
+  });
+  s.matrix[id] = Object.fromEntries(s.issues.map((iss) => [iss.id, defaultCell(iss)]));
+  return s;
+}
+
+export function renameDelegation(s0, from, to) {
+  if (from === to) return s0;
+  const s = clone(s0);
+  const d = s.delegations.find((x) => x.id === from);
+  if (!d || s.delegations.some((x) => x.id === to)) return s0;
+  d.id = to;
+  s.matrix[to] = s.matrix[from] || {};
+  delete s.matrix[from];
+  return s;
+}
+
+export function removeDelegation(s0, id) {
+  const s = clone(s0);
+  s.delegations = s.delegations.filter((d) => d.id !== id);
+  delete s.matrix[id];
+  return s;
+}
+
+export function addIssue(s0) {
+  const s = clone(s0);
+  const id = uniqueId("issue", new Set(s.issues.map((i) => i.id)));
+  const iss = { id, label: "NEW ISSUE", short: "New issue", type: "ranked", options: ["Option A", "Option B", "Option C"] };
+  s.issues.push(iss);
+  for (const d of s.delegations) (s.matrix[d.id] ||= {})[id] = defaultCell(iss);
+  return s;
+}
+
+export function renameIssue(s0, from, to) {
+  if (from === to) return s0;
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === from);
+  if (!iss || s.issues.some((x) => x.id === to)) return s0;
+  iss.id = to;
+  for (const d of s.delegations) {
+    const row = s.matrix[d.id] || {};
+    if (from in row) { row[to] = row[from]; delete row[from]; }
+    if (d.priority === from) d.priority = to;
+    if (d.redLines && from in d.redLines) { d.redLines[to] = d.redLines[from]; delete d.redLines[from]; }
+  }
+  return s;
+}
+
+export function removeIssue(s0, id) {
+  const s = clone(s0);
+  s.issues = s.issues.filter((i) => i.id !== id);
+  for (const d of s.delegations) {
+    if (s.matrix[d.id]) delete s.matrix[d.id][id];
+    if (d.priority === id) d.priority = null;
+    if (d.redLines) delete d.redLines[id];
+  }
+  return s;
+}
+
+export function setIssueType(s0, id, type) {
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === id);
+  if (!iss || iss.type === type) return s0;
+  iss.type = type;
+  for (const d of s.delegations) {
+    const row = (s.matrix[d.id] ||= {});
+    const v = row[id];
+    if (type === "ranked") {
+      // The required option becomes #1, the rest keep their listed order.
+      const req = Number.isInteger(v) ? v : 0;
+      const order = [req, ...iss.options.map((_, i) => i).filter((i) => i !== req)];
+      row[id] = iss.options.map((_, i) => order.indexOf(i) + 1);
+    } else {
+      row[id] = Array.isArray(v) && v.indexOf(1) >= 0 ? v.indexOf(1) : 0;
+    }
+  }
+  return s;
+}
+
+/* Add an option at the end: ranked last by everyone, nobody's requirement. */
+export function addOption(s0, id) {
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === id);
+  if (!iss) return s0;
+  iss.options.push(`Option ${String.fromCharCode(65 + iss.options.length)}`);
+  if (iss.pillOptions) iss.pillOptions.push(iss.options[iss.options.length - 1]);
+  for (const d of s.delegations) {
+    const row = (s.matrix[d.id] ||= {});
+    if (iss.type === "ranked") row[id] = [...(Array.isArray(row[id]) ? row[id] : defaultCell({ ...iss, options: iss.options.slice(0, -1) })), iss.options.length];
+  }
+  return s;
+}
+
+export function removeOption(s0, id, k) {
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === id);
+  if (!iss || iss.options.length <= 2) return s0;
+  iss.options.splice(k, 1);
+  if (iss.pillOptions) iss.pillOptions.splice(k, 1);
+  for (const d of s.delegations) {
+    const row = (s.matrix[d.id] ||= {});
+    const v = row[id];
+    if (iss.type === "ranked") row[id] = Array.isArray(v) ? rerank(v.filter((_, i) => i !== k)) : defaultCell(iss);
+    else row[id] = v === k ? 0 : v > k ? v - 1 : v;
+    if (d.redLines?.[id]) d.redLines[id] = d.redLines[id].filter((i) => i !== k).map((i) => (i > k ? i - 1 : i));
+  }
+  return s;
+}
+
+/* Move option k by delta (-1 up, +1 down); rankings follow the option. */
+export function moveOption(s0, id, k, delta) {
+  const j = k + delta;
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === id);
+  if (!iss || j < 0 || j >= iss.options.length) return s0;
+  const swap = (arr) => { if (Array.isArray(arr)) [arr[k], arr[j]] = [arr[j], arr[k]]; };
+  swap(iss.options);
+  swap(iss.pillOptions);
+  const remap = (i) => (i === k ? j : i === j ? k : i);
+  for (const d of s.delegations) {
+    const row = (s.matrix[d.id] ||= {});
+    if (iss.type === "ranked") swap(row[id]);
+    else if (Number.isInteger(row[id])) row[id] = remap(row[id]);
+    if (d.redLines?.[id]) d.redLines[id] = d.redLines[id].map(remap);
+  }
+  return s;
+}
+
+/* Put option `opt` at rank `rank` (1-based) for a delegation; whatever held
+   that rank takes opt's old rank, so the cell stays a permutation. */
+export function setRank(s0, delegation, id, rank, opt) {
+  const s = clone(s0);
+  const iss = s.issues.find((x) => x.id === id);
+  const row = (s.matrix[delegation] ||= {});
+  const ranks = Array.isArray(row[id]) && row[id].length === iss.options.length ? [...row[id]] : defaultCell(iss);
+  const holder = ranks.indexOf(rank);
+  const old = ranks[opt];
+  if (holder >= 0) ranks[holder] = old;
+  ranks[opt] = rank;
+  row[id] = ranks;
+  return s;
+}
+
+export function renameMood(s0, from, to) {
+  if (from === to) return s0;
+  const s = clone(s0);
+  const moods = s.publicDiplomacy.moods;
+  if (!(from in moods) || to in moods) return s0;
+  // Keep key order so the console lists moods as before.
+  s.publicDiplomacy.moods = Object.fromEntries(Object.entries(moods).map(([k, v]) => [k === from ? to : k, v]));
+  if (s.publicDiplomacy.defaultMood === from) s.publicDiplomacy.defaultMood = to;
+  for (const j of s.injects) if (j.mood === from) j.mood = to;
+  return s;
+}
+
+export function removeMood(s0, key) {
+  const s = clone(s0);
+  const moods = s.publicDiplomacy.moods;
+  if (Object.keys(moods).length <= 1) return s0;
+  delete moods[key];
+  if (s.publicDiplomacy.defaultMood === key) s.publicDiplomacy.defaultMood = Object.keys(moods)[0];
+  for (const j of s.injects) if (j.mood === key) j.mood = null;
+  return s;
+}
+
+/* Postures are referenced by name in each mood's favored/penalized lists. */
+export function setPostures(s0, postures) {
+  const s = clone(s0);
+  const keep = new Set(postures);
+  s.publicDiplomacy.postures = postures;
+  for (const m of Object.values(s.publicDiplomacy.moods)) {
+    m.favored = (m.favored || []).filter((p) => keep.has(p));
+    m.penalized = (m.penalized || []).filter((p) => keep.has(p));
+  }
+  return s;
+}
+
+export function moveItem(list, i, delta) {
+  const j = i + delta;
+  if (j < 0 || j >= list.length) return list;
+  const out = [...list];
+  [out[i], out[j]] = [out[j], out[i]];
+  return out;
+}
+
+/* Fill in the structure the editor's forms need, without overwriting
+   anything, so a cartridge with problems can still be opened and fixed. */
+export function editableCartridge(s0) {
+  const s = normalizeCartridge(s0);
+  s.delegations = (Array.isArray(s.delegations) ? s.delegations : []).filter(isObj)
+    .map((d) => ({ ...d, ministry: isObj(d.ministry) ? d.ministry : {}, redLines: isObj(d.redLines) ? d.redLines : {} }));
+  s.issues = (Array.isArray(s.issues) ? s.issues : []).filter(isObj)
+    .map((i) => ({ type: "ranked", ...i, options: Array.isArray(i.options) ? i.options : [] }));
+  s.matrix = isObj(s.matrix) ? s.matrix : {};
+  const pd = isObj(s.publicDiplomacy) ? s.publicDiplomacy : {};
+  s.publicDiplomacy = {
+    enabled: true, scoringContext: "", pressRoomTag: "PRESS ROOM", ...pd,
+    postures: Array.isArray(pd.postures) && pd.postures.length ? pd.postures : ["Reassure", "Pressure", "Defend", "Condemn", "Signal flexibility"],
+    windows: { total: 2, minutes: 6, missedPenalty: 4, ...(isObj(pd.windows) ? pd.windows : {}) },
+    moods: isObj(pd.moods) && Object.keys(pd.moods).length ? pd.moods : { NEUTRAL: { dispatch: "", we: 1, wl: 1, wp: 1, favored: [], penalized: [] } },
+  };
+  if (!s.publicDiplomacy.moods[s.publicDiplomacy.defaultMood]) s.publicDiplomacy.defaultMood = Object.keys(s.publicDiplomacy.moods)[0];
+  return normalizeCartridge(s);
+}
