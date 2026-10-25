@@ -1,6 +1,6 @@
 AWSTemplateFormatVersion: "2010-09-09"
 Transform: AWS::Serverless-2016-10-31
-Description: Accord Console backend - Claude proxy (Bedrock) and shared game storage
+Description: Accord Console backend - Claude proxy (Bedrock), accounts (Cognito) and game storage (DynamoDB)
 
 Parameters:
   ModelId:
@@ -10,7 +10,15 @@ Parameters:
   AllowedOrigin:
     Type: String
     Default: "*"
-    Description: Frontend origin allowed by CORS (set to the CloudFront URL once it exists)
+    Description: Frontend origin allowed by CORS (set to the SiteUrl output once it exists)
+  DevOrigin:
+    Type: String
+    Default: http://localhost:5173
+    Description: Second CORS origin for local development (vite dev server)
+  ProfessorEmails:
+    Type: String
+    Default: ""
+    Description: Comma-separated bootstrap professors (can't be revoked in the app); others are invited through the Professors table
 
 Globals:
   Function:
@@ -23,12 +31,316 @@ Resources:
     Type: AWS::Serverless::HttpApi
     Properties:
       CorsConfiguration:
-        AllowOrigins: [!Ref AllowedOrigin]
+        AllowOrigins: [!Ref AllowedOrigin, !Ref DevOrigin]
         AllowMethods: [GET, PUT, POST, DELETE, OPTIONS]
-        AllowHeaders: [content-type]
+        AllowHeaders: [content-type, authorization]
+      # Sized for several classes polling at once (~1 request / 5 s per browser).
       DefaultRouteSettings:
-        ThrottlingBurstLimit: 20
-        ThrottlingRateLimit: 10
+        ThrottlingBurstLimit: 200
+        ThrottlingRateLimit: 100
+      # /ai is public and calls Bedrock, so it keeps the tight cap.
+      RouteSettings:
+        "POST /ai":
+          ThrottlingBurstLimit: 20
+          ThrottlingRateLimit: 10
+      # Opt-in per route (Auth: Authorizer: CognitoJwt); /ai stays public.
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            IdentitySource: $request.header.Authorization
+            JwtConfiguration:
+              issuer: !Sub https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}
+              audience: [!Ref UserPoolClient]
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub ${AWS::StackName}-users
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Schema:
+        - Name: email
+          Required: true
+          Mutable: true
+        - Name: name
+          Required: true
+          Mutable: true
+      Policies:
+        PasswordPolicy:
+          MinimumLength: 8
+          RequireLowercase: false
+          RequireUppercase: false
+          RequireNumbers: true
+          RequireSymbols: false
+      AccountRecoverySetting:
+        RecoveryMechanisms:
+          - Name: verified_email
+            Priority: 1
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      ClientName: accord-web
+      GenerateSecret: false
+      # USER_PASSWORD_AUTH (over TLS) is what src/auth.js and backend/games/smoke.mjs use.
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_USER_PASSWORD_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+      IdTokenValidity: 1
+      RefreshTokenValidity: 30
+      TokenValidityUnits:
+        IdToken: hours
+        RefreshToken: days
+
+  # Stamps a `role` claim (professor | student) onto every ID token.
+  RoleClaimFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: auth/
+      Handler: preToken.handler
+      Timeout: 5
+      Environment:
+        Variables:
+          PROFESSOR_EMAILS: !Ref ProfessorEmails
+          PROFESSORS_TABLE: !Ref ProfessorsTable
+      Policies:
+        - Statement:
+            - Effect: Allow
+              Action: [dynamodb:GetItem, dynamodb:UpdateItem]
+              Resource: !GetAtt ProfessorsTable.Arn
+      Events:
+        PreToken:
+          Type: Cognito
+          Properties:
+            UserPool: !Ref UserPool
+            Trigger: PreTokenGeneration
+
+  GamesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: gameId, AttributeType: S }
+        - { AttributeName: ownerId, AttributeType: S }
+        - { AttributeName: updatedAt, AttributeType: S }
+      KeySchema:
+        - { AttributeName: gameId, KeyType: HASH }
+      GlobalSecondaryIndexes:
+        - IndexName: byOwner
+          KeySchema:
+            - { AttributeName: ownerId, KeyType: HASH }
+            - { AttributeName: updatedAt, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Game state document (gzip), kept apart from Games so listings stay small.
+  GameDocsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: gameId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: gameId, KeyType: HASH }
+
+  MembersTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: userId, AttributeType: S }
+        - { AttributeName: gameId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: userId, KeyType: HASH }
+        - { AttributeName: gameId, KeyType: RANGE }
+      GlobalSecondaryIndexes:
+        - IndexName: byGame
+          KeySchema:
+            - { AttributeName: gameId, KeyType: HASH }
+            - { AttributeName: userId, KeyType: RANGE }
+          Projection: { ProjectionType: ALL }
+
+  # Active join words -> gameId. Rows are removed when a game is completed.
+  CodesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: code, AttributeType: S }
+      KeySchema:
+        - { AttributeName: code, KeyType: HASH }
+
+  # Professors invited through the app, keyed by lowercased email. Bootstrap
+  # professors (ProfessorEmails) are not stored here.
+  ProfessorsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: email, AttributeType: S }
+      KeySchema:
+        - { AttributeName: email, KeyType: HASH }
+
+  # Scenario library (uploaded cartridges, body gzipped). Games keep their own copy.
+  ScenariosTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - { AttributeName: scenarioId, AttributeType: S }
+      KeySchema:
+        - { AttributeName: scenarioId, KeyType: HASH }
+
+  GamesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: games/
+      Handler: index.handler
+      Timeout: 10
+      Environment:
+        Variables:
+          GAMES_TABLE: !Ref GamesTable
+          DOCS_TABLE: !Ref GameDocsTable
+          MEMBERS_TABLE: !Ref MembersTable
+          CODES_TABLE: !Ref CodesTable
+          PROFESSORS_TABLE: !Ref ProfessorsTable
+          SCENARIOS_TABLE: !Ref ScenariosTable
+          PROFESSOR_EMAILS: !Ref ProfessorEmails
+      Policies:
+        - DynamoDBCrudPolicy: { TableName: !Ref GamesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref GameDocsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref MembersTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref CodesTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ProfessorsTable }
+        - DynamoDBCrudPolicy: { TableName: !Ref ScenariosTable }
+      Events:
+        ListScenarios:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        CreateScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        GetScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        ReplaceScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: PUT
+            Auth:
+              Authorizer: CognitoJwt
+        DeleteScenario:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /scenarios/{scenarioId}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoJwt
+        ListProfessors:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        InviteProfessor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        RevokeProfessor:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /professors/{email}
+            Method: DELETE
+            Auth:
+              Authorizer: CognitoJwt
+        ListGames:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        CreateGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        JoinGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/join
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        GetGame:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        GetDoc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/doc
+            Method: GET
+            Auth:
+              Authorizer: CognitoJwt
+        PutDoc:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/doc
+            Method: PUT
+            Auth:
+              Authorizer: CognitoJwt
+        AssignDelegation:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/assign
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
+        SetStatus:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref Api
+            Path: /games/{gameId}/status
+            Method: POST
+            Auth:
+              Authorizer: CognitoJwt
 
   AiFunction:
     Type: AWS::Serverless::Function
@@ -54,7 +366,83 @@ Resources:
             Path: /ai
             Method: POST
 
+  # Static frontend: private bucket, served only through CloudFront (OAC).
+  SiteBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+
+  SiteOriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub ${AWS::StackName}-site
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  SiteDistribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Enabled: true
+        DefaultRootObject: index.html
+        HttpVersion: http2and3
+        PriceClass: PriceClass_100
+        Origins:
+          - Id: site
+            DomainName: !GetAtt SiteBucket.RegionalDomainName
+            OriginAccessControlId: !GetAtt SiteOriginAccessControl.Id
+            S3OriginConfig:
+              OriginAccessIdentity: ""
+        DefaultCacheBehavior:
+          TargetOriginId: site
+          ViewerProtocolPolicy: redirect-to-https
+          Compress: true
+          # Managed CachingOptimized. Hashed assets cache long; `npm run deploy:web`
+          # invalidates /index.html so new builds show up immediately.
+          CachePolicyId: 658327ea-f89d-4fab-a63d-7e88639e58f6
+        # S3 answers 403 for missing keys; routing is query-string based (?game=…),
+        # so any miss just gets the app shell.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+
+  SiteBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref SiteBucket
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal: { Service: cloudfront.amazonaws.com }
+            Action: s3:GetObject
+            Resource: !Sub ${SiteBucket.Arn}/*
+            Condition:
+              StringEquals:
+                AWS:SourceArn: !Sub arn:aws:cloudfront::${AWS::AccountId}:distribution/${SiteDistribution}
+
 Outputs:
+  SiteUrl:
+    Description: Public frontend URL (use as AllowedOrigin)
+    Value: !Sub https://${SiteDistribution.DomainName}
+  SiteBucketName:
+    Description: Bucket that `npm run deploy:web` syncs dist/ into
+    Value: !Ref SiteBucket
+  SiteDistributionId:
+    Description: Distribution that `npm run deploy:web` invalidates
+    Value: !Ref SiteDistribution
   ApiUrl:
     Description: Base URL for VITE_API_URL
     Value: !Sub https://${Api}.execute-api.${AWS::Region}.amazonaws.com
+  UserPoolId:
+    Description: Value for VITE_COGNITO_USER_POOL_ID
+    Value: !Ref UserPool
+  UserPoolClientId:
+    Description: Value for VITE_COGNITO_CLIENT_ID
+    Value: !Ref UserPoolClient

@@ -3,6 +3,7 @@
   "private": true,
   "type": "module",
   "main": "index.mjs",
+  "version": "1.0.0",
   "dependencies": {
     "@anthropic-ai/bedrock-sdk": "^0.34.4"
   }
