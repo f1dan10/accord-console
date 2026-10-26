@@ -13,6 +13,63 @@ export class CartridgeError extends Error {}
 const DELEGATION_RE = /^[A-Za-z0-9_-]{1,40}$/; // same rule as the games API
 export const MAX_CARTRIDGE_CHARS = 200_000;     // serialized JSON, same cap as the API
 
+/* ---- game modes ----
+   Every cartridge declares which of the three game types it is. The type is
+   chosen FIRST when designing a game, because each type has its own scoring
+   rubric: the engine dispatches on `mode` to pick the rubric to apply.
+
+   `scoring` names that rubric (see the scoring registry in App.jsx).
+   `implemented` says whether the engine actually has it yet. Today only
+   "accord" does. A standoff or estimate cartridge is still valid — it can be
+   authored, saved, shared and opened — but the engine says plainly that it
+   cannot score it rather than quietly scoring it as an accord, which would
+   produce confident wrong numbers.
+
+   To implement a rubric: write it in App.jsx's registry, then flip
+   `implemented` to true here. Nothing else needs to change. */
+export const GAME_MODES = {
+  accord: {
+    id: "accord",
+    name: "Accord",
+    label: "Accord — cooperative, everyone works toward one deal",
+    blurb: "Cooperative. All delegations work to reach an agreement. Not zero-sum: every team wins or loses together, though some win more than others. AI can play an antagonist Red Cell as well as the White Cell.",
+    scoring: "accord",
+    implemented: true,
+  },
+  standoff: {
+    id: "standoff",
+    name: "Standoff",
+    label: "Standoff — zero-sum, one side wins and one loses",
+    blurb: "Zero-sum, with one side winning and the other losing: a pure binary outcome. AI can play the White Cell, or a third party whose moves change what the two main cells do.",
+    scoring: "standoff",
+    implemented: false,
+  },
+  estimate: {
+    id: "estimate",
+    name: "Estimate",
+    label: "Estimate — one team manages an external crisis",
+    blurb: "A team faces an external crisis it has to address or manage, which may not be solvable. They succeed or they don't, and some scenarios allow an in-between. AI plays the antagonist and may play a White Cell role as well.",
+    scoring: "estimate",
+    implemented: false,
+  },
+};
+
+export const MODE_IDS = Object.keys(GAME_MODES);
+export const DEFAULT_MODE = "accord";
+
+/* The mode record for a cartridge. Falls back to accord so callers never have
+   to null-check; checkCartridge is what rejects an unknown mode. */
+export function modeOf(s) {
+  return GAME_MODES[s && s.mode] || GAME_MODES[DEFAULT_MODE];
+}
+
+/* Does the engine have a scoring rubric for this cartridge's game type?
+   The editor and the facilitator console both use this to say plainly when a
+   scenario can be run but not yet scored. */
+export function scoringReady(s) {
+  return modeOf(s).implemented === true;
+}
+
 /* ---- parsing ---- */
 
 export function parseCartridge(text) {
@@ -167,7 +224,13 @@ export function normalizeCartridge(raw) {
     catch { throw new CartridgeError("matrixB64 isn't valid base64-encoded JSON."); }
   }
   delete s.matrixB64;
-  s.mode ??= "accord";
+  /* Missing mode: an older cartridge, written before game types existed, and
+     every one of those is an accord. Present but odd: trimmed and lowercased
+     so "Standoff " matches, then left alone — checkCartridge rejects anything
+     that still isn't one of the three, rather than silently calling it an
+     accord and scoring it with the wrong rubric. */
+  if (s.mode == null || s.mode === "") s.mode = DEFAULT_MODE;
+  else if (typeof s.mode === "string") s.mode = s.mode.trim().toLowerCase();
   s.meta = isObj(s.meta) ? s.meta : {};
   s.scoring = { dealWeight: 0.8, credWeight: 0.2, mediatorClosureShare: 0.5, startCred: 50, ...(isObj(s.scoring) ? s.scoring : {}) };
   s.mechanics = { amendmentPolicy: "reconfirm", injectAckRequired: true, maxLiveDrafts: null, ...(isObj(s.mechanics) ? s.mechanics : {}) };
@@ -193,6 +256,12 @@ export function checkCartridge(s) {
   const hard = (text) => findings.push({ level: "hard", text });
   const findings = [];
   if (!isObj(s)) return [{ level: "hard", text: "A cartridge must be an object." }];
+
+  /* Game type first: it decides which scoring rubric the engine applies, so a
+     cartridge that doesn't name one the engine knows can't be scored at all. */
+  if (!MODE_IDS.includes(s.mode)) {
+    hard(`mode ${JSON.stringify(s.mode)} isn't a game type. Use one of: ${MODE_IDS.join(", ")}.`);
+  }
 
   const meta = s.meta || {};
   if (!meta.id || typeof meta.id !== "string") hard("meta.id is missing (a short id such as \"ind26\").");
@@ -322,13 +391,18 @@ export function designRules(s) {
   return findings;
 }
 
-/* One-line description for library listings. */
+/* One-line description for library listings. The game type leads, since it is
+   the first thing that decides how a scenario plays and how it is scored. */
 export function summarize(s) {
   const n = (x, one) => `${x} ${one}${x === 1 ? "" : "s"}`;
+  const mode = modeOf(s);
   return {
     title: s.meta.title,
+    mode: mode.id,
+    modeName: mode.name,
+    scoringReady: mode.implemented,
     delegations: s.delegations.map((d) => ({ id: d.id, name: d.name, flag: d.flag || "" })),
-    text: [n(s.delegations.length, "delegation"), n(s.issues.length, "issue"), n(s.injects.length, "inject")].join(" · "),
+    text: [mode.name, n(s.delegations.length, "delegation"), n(s.issues.length, "issue"), n(s.injects.length, "inject")].join(" · "),
   };
 }
 
