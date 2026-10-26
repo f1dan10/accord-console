@@ -7,6 +7,7 @@ import { api } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
 import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge } from "./cartridge.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
+import ScenarioWizard from "./ScenarioWizard.jsx";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -2684,7 +2685,7 @@ function Facilitator({ sh, game, onExit }) {
           <div className="text-xs mb-2 opacity-70">Current mood <b>{pub.mood}</b> — weights E×{MOODS[pub.mood]?.we} L×{MOODS[pub.mood]?.wl} P×{MOODS[pub.mood]?.wp}
             {MOODS[pub.mood]?.favored.length ? ` \u00b7 favors ${MOODS[pub.mood].favored.join(", ")}` : ""}
             {MOODS[pub.mood]?.penalized.length ? ` \u00b7 penalizes ${MOODS[pub.mood].penalized.join(", ")}` : ""}</div>
-          
+
           <h3 className="font-bold tracking-wide mt-6 mb-2">TEST BENCH <span className="font-normal text-xs opacity-60">(scores a sample — affects nothing)</span></h3>
           <textarea value={benchText} onChange={(e) => setBenchText(e.target.value.slice(0, 400))} rows={3}
             placeholder="Paste or write a sample statement…"
@@ -3895,6 +3896,7 @@ const EDITOR_UI = { GOLD, PAPER, CARD, BTN_PRIMARY, BTN_SECONDARY, INPUT: AUTH_I
 function ScenarioLibrary({ me }) {
   const [list, setList] = useState(null);
   const [editing, setEditing] = useState(null); // { initial, replacing }
+  const [wizard, setWizard] = useState(false);  // guided setup, hands off to the editor
   const [pending, setPending] = useState(null); // { cartridge, findings, fileName, replacing? }
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -3970,13 +3972,20 @@ function ScenarioLibrary({ me }) {
         {editing ? (
           <ScenarioEditor key={editing.replacing?.scenarioId || "new"} initial={editing.initial} replacing={editing.replacing} ui={EDITOR_UI}
             onSaved={saved} onCancel={() => setEditing(null)} />
+        ) : wizard ? (
+          /* Guided setup builds the cartridge, then hands it to the editor —
+             it never saves on its own, so the rankings get a pass first. */
+          <ScenarioWizard ui={EDITOR_UI} onCancel={() => setWizard(false)}
+            onBuilt={(cartridge) => { setWizard(false); setDone(""); setPending(null); setEditing({ initial: cartridge, replacing: null }); }} />
         ) : <>
         <div className="flex items-center gap-3 flex-wrap mb-3">
+          <button onClick={() => { setDone(""); setPending(null); setWizard(true); }}
+            className="px-3 py-2 rounded text-sm font-bold" style={BTN_PRIMARY}>Guided setup</button>
           <button onClick={() => { setDone(""); setPending(null); setEditing({ initial: blankCartridge(SCENARIO), replacing: null }); }}
-            className="px-3 py-2 rounded text-sm font-bold" style={BTN_PRIMARY}>New scenario</button>
+            className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>New scenario</button>
           {fileInput((f) => pick(f), "Upload cartridge", false)}
           <button onClick={() => downloadJson("template.json", normalizeCartridge(SCENARIO))} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Download template</button>
-          <span className="text-xs" style={{ opacity: 0.7 }}>Build one in the editor, or upload a .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you save.</span>
+          <span className="text-xs" style={{ opacity: 0.7 }}>Answer a few questions and we'll build the cartridge, start from a blank one in the editor, or upload a .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you save.</span>
         </div>
         {pending && <CartridgePreview pending={pending} busy={busy === "save"} onSave={save} onCancel={() => setPending(null)}
           onEdit={() => { setEditing({ initial: pending.cartridge, replacing: pending.replacing }); setPending(null); }} />}

@@ -442,6 +442,108 @@ export function blankCartridge(template) {
   return s;
 }
 
+/* ---- guided setup ----
+   The questionnaire in ScenarioWizard.jsx collects plain answers; these turn
+   them into a cartridge. Kept here, beside the other builders, so the UI holds
+   no cartridge-shaping logic and this stays testable on its own. */
+
+/* An issue's options, one per line, blanks dropped. */
+export function optionLines(text) {
+  return String(text || "").split("\n").map((o) => o.trim()).filter(Boolean);
+}
+
+/* A delegation or issue id derived from what the professor typed. Ids are
+   referenced by the matrix, priorities and red lines, so they must match the
+   API's rule; the fallback keeps a cartridge valid when a name is punctuation
+   only or in a non-Latin script. */
+function slugify(name, fallback, taken) {
+  const base = String(name || "").trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  let id = DELEGATION_RE.test(base) && base.toLowerCase() !== "observer" ? base : fallback;
+  let n = 2;
+  while (taken.has(id)) { id = `${fallback}${n}`; n += 1; }
+  taken.add(id);
+  return id;
+}
+
+/* Answers in, cartridge out. Anything the wizard doesn't ask about is left to
+   editableCartridge, which fills the engine's defaults (postures, press
+   windows, a neutral mood).
+
+   Rankings are deliberately NOT asked for: that is one question per
+   delegation per issue per option, and the editor's Rankings grid is the
+   right place for it. Every delegation starts ranking the options in listed
+   order — structurally valid, and deliberately uninteresting, so the review
+   step and the editor's design notes both point at it. */
+export function cartridgeFromAnswers(a) {
+  const delTaken = new Set();
+  const delegations = (a.delegations || []).map((d, i) => {
+    const id = slugify(d.name, `Delegation${i + 1}`, delTaken);
+    const name = String(d.name || "").trim() || id;
+    return {
+      id,
+      name,
+      flag: String(d.flag || "").trim() || "🏳️",
+      mediator: !!d.mediator,
+      ministry: {
+        wire: `${name.toUpperCase()} — FOREIGN MINISTRY`,
+        title: "Foreign Ministry",
+        speaker: `The Foreign Ministry of ${name}`,
+      },
+      priority: null,
+      noDealPct: 30,
+      redLines: {},
+      domestic: { label: `${name} public`, dispatch: "", moods: {} },
+    };
+  });
+
+  const issTaken = new Set();
+  const issues = (a.issues || []).map((iss, i) => {
+    const label = String(iss.label || "").trim() || `Issue ${i + 1}`;
+    const options = optionLines(iss.options);
+    return {
+      id: slugify(iss.label, `issue${i + 1}`, issTaken),
+      label: label.toUpperCase(),
+      short: label,
+      type: "ranked",
+      options,
+      pillOptions: options.map((o) => (o.length > 14 ? `${o.slice(0, 13)}…` : o)),
+    };
+  });
+
+  const matrix = {};
+  for (const d of delegations) {
+    matrix[d.id] = {};
+    for (const iss of issues) matrix[d.id][iss.id] = iss.options.map((_, k) => k + 1);
+  }
+
+  const title = String(a.title || "").trim() || "NEW SCENARIO";
+  return editableCartridge({
+    mode: a.mode,
+    meta: {
+      id: String(a.metaId || "").trim() || `sc${Date.now().toString(36).slice(-6)}`,
+      title: title.toUpperCase(),
+      gateTagline: title.toUpperCase(),
+      projectorSubtitle: title.toUpperCase(),
+      clockLabel: "TIME TO CLOSE",
+      deadlineMinutes: Number(a.minutes) || 60,
+      adoptedBanner: "✦ AGREEMENT ADOPTED ✦",
+      collapseBanner: "✦ NO AGREEMENT ✦",
+      collapseNote: "The session closed without an agreement.",
+    },
+    delegations,
+    issues,
+    matrix,
+    publicDiplomacy: {
+      enabled: true,
+      scoringContext: String(a.context || "").trim() || title.toLowerCase(),
+      moods: { NEUTRAL: { dispatch: "Public attention is steady.", we: 1, wl: 1, wp: 1, favored: [], penalized: [] } },
+      defaultMood: "NEUTRAL",
+    },
+    injects: [],
+    mechanics: { amendmentPolicy: "reconfirm", injectAckRequired: true, maxLiveDrafts: 4, redLineMode: "hard" },
+  });
+}
+
 export function addDelegation(s0) {
   const s = clone(s0);
   const id = uniqueId("Delegation", new Set(s.delegations.map((d) => d.id)));
