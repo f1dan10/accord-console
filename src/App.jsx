@@ -3,7 +3,7 @@ import {
   authConfigured, currentUser, onAuthChange, signIn, signUp, signOut,
   confirmSignUp, resendCode, forgotPassword, resetPassword,
 } from "./auth.js";
-import { api } from "./api.js";
+import { api, API_CONFIGURED } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
 import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge } from "./cartridge.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
@@ -372,10 +372,13 @@ function receptionLabel(net) {
    It is inserted into release builds from a private file. The placeholder keeps the
    grader working end to end: three dimensions, each scored 0–5, plus relevance 0–3. */
 const RUBRIC_TEXT = "DIMENSION A (placeholder): 0-5, how well the statement is supported.\nDIMENSION B (placeholder): 0-5, how well the statement is argued.\nDIMENSION C (placeholder): 0-5, how well the statement resonates with its audience.";
-/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is chosen server-side. */
-const AI_URL = `${import.meta.env.VITE_API_URL}/ai`;
+/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is
+   chosen server-side. They go through api(), like every other call, so each one
+   carries the signed-in user's token: /ai requires it, and api() also refreshes
+   an expiring token mid-game rather than letting a long session start failing. */
 const RUBRIC_LABELS = ["Dimension A", "Dimension B", "Dimension C"];
 async function scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars }) {
+  if (!API_CONFIGURED) throw new Error("ai-not-configured");
   const exBlock = exemplars && exemplars.length
     ? `\n\nCALIBRATION EXAMPLES \u2014 these were graded by the head facilitator. Match this standard exactly.\n` +
       exemplars.map((x, i) =>
@@ -392,12 +395,7 @@ Communiqué text:
 """${text}"""${exBlock}
 
 Respond ONLY with a JSON object, no preamble, no markdown fences: {"e": n, "l": n, "p": n, "ad_hominem": bool, "relevance": n}`;
-  const response = await fetch(AI_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, max_tokens: 1000 }),
-  });
-  const data = await response.json();
+  const data = await api("POST", "/ai", { prompt, max_tokens: 1000 });
   const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   const clean = txt.replace(/```json|```/g, "").trim();
   const parsed = JSON.parse(clean);
@@ -798,8 +796,14 @@ async function opFileCommunique(team, { posture, subject, subjectLabel, text, mo
   try {
     const exemplars = await sGet(K.exemplars, []);
     sx = await scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars });
-  } catch {
-    sx = { e: 2, l: 2, p: 2, ad_hominem: false };
+  } catch (err) {
+    /* Never lose a filing to a scoring failure — but say so. A neutral 2/2/2
+       nets zero, so an unnoticed run of these leaves credibility flat all game
+       and the public-diplomacy half of the scenario does nothing. `unscored`
+       rides into the session export, so a debrief can tell these apart from
+       statements Claude actually graded. */
+    console.warn("[accord] statement scoring failed — applying neutral placeholder:", err);
+    sx = { e: 2, l: 2, p: 2, ad_hominem: false, unscored: true };
   }
   const { net } = computeNet(sx, posture, moodKey);
   /* Atomic over pub (credibility + sentiment) AND comms scoring — computed
@@ -1085,17 +1089,16 @@ async function composeAiCommunique(team, { subject, posture, leadTeam, moodDispa
     : subject.stance === "for"
       ? `${MINISTRY[team].speaker} welcomes the ${leadTeam} text as a serious basis for agreement, and calls on all delegations to move from posturing to signature.`
       : `${MINISTRY[team].speaker} cannot accept the ${leadTeam} text as drafted${worstIss ? `, above all on ${worstIss.label.toLowerCase().replace(/\?$/, "")}` : ""}. A durable agreement will not be built on terms our public cannot defend.`;
+  if (!API_CONFIGURED) return fallback;
   try {
     const prompt = `You write one official communiqué (max 380 characters, no quotation marks around it, no preamble) for ${MINISTRY[team].wire} in ${PD.scoringContext}. Posture: ${posture}. Subject: ${subjectLabel}. Current press climate: "${moodDispatch}". Speak in the institutional first-person plural of ${MINISTRY[team].speaker}. Be specific and rhetorically strong — cite a principle or fact, reason clearly, and match the public temperature. Output ONLY the statement text.`;
-    const res = await fetch(AI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, max_tokens: 300 }),
-    });
-    const data = await res.json();
+    const data = await api("POST", "/ai", { prompt, max_tokens: 300 });
     const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
     return txt ? txt.slice(0, 400) : fallback;
-  } catch { return fallback; }
+  } catch (err) {
+    console.warn("[accord] AI communiqué failed, using the written fallback:", err);
+    return fallback;
+  }
 }
 
 /* ---- Audio ---- */
@@ -2685,7 +2688,7 @@ function Facilitator({ sh, game, onExit }) {
           <div className="text-xs mb-2 opacity-70">Current mood <b>{pub.mood}</b> — weights E×{MOODS[pub.mood]?.we} L×{MOODS[pub.mood]?.wl} P×{MOODS[pub.mood]?.wp}
             {MOODS[pub.mood]?.favored.length ? ` \u00b7 favors ${MOODS[pub.mood].favored.join(", ")}` : ""}
             {MOODS[pub.mood]?.penalized.length ? ` \u00b7 penalizes ${MOODS[pub.mood].penalized.join(", ")}` : ""}</div>
-
+          
           <h3 className="font-bold tracking-wide mt-6 mb-2">TEST BENCH <span className="font-normal text-xs opacity-60">(scores a sample — affects nothing)</span></h3>
           <textarea value={benchText} onChange={(e) => setBenchText(e.target.value.slice(0, 400))} rows={3}
             placeholder="Paste or write a sample statement…"

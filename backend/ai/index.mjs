@@ -8,7 +8,10 @@ import AnthropicBedrock from "@anthropic-ai/bedrock-sdk";
 const client = new AnthropicBedrock({ awsRegion: process.env.AWS_REGION });
 const MODEL = process.env.MODEL_ID || "global.anthropic.claude-sonnet-4-6";
 
-// The endpoint is public, so keep requests to the shapes the app sends.
+/* The API Gateway route carries the CognitoJwt authorizer, so a request only
+   reaches this handler with a valid signed-in user's token. These caps stay
+   anyway: a signed-in user is not the same as a trusted one, and they bound
+   what one account can spend per call. */
 const MAX_PROMPT_CHARS = 20000;
 const MAX_TOKENS_CAP = 1000;
 
