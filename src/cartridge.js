@@ -13,6 +13,63 @@ export class CartridgeError extends Error {}
 const DELEGATION_RE = /^[A-Za-z0-9_-]{1,40}$/; // same rule as the games API
 export const MAX_CARTRIDGE_CHARS = 200_000;     // serialized JSON, same cap as the API
 
+/* ---- game modes ----
+   Every cartridge declares which of the three game types it is. The type is
+   chosen FIRST when designing a game, because each type has its own scoring
+   rubric: the engine dispatches on `mode` to pick the rubric to apply.
+
+   `scoring` names that rubric (see the scoring registry in App.jsx).
+   `implemented` says whether the engine actually has it yet. Today only
+   "accord" does. A standoff or estimate cartridge is still valid — it can be
+   authored, saved, shared and opened — but the engine says plainly that it
+   cannot score it rather than quietly scoring it as an accord, which would
+   produce confident wrong numbers.
+
+   To implement a rubric: write it in App.jsx's registry, then flip
+   `implemented` to true here. Nothing else needs to change. */
+export const GAME_MODES = {
+  accord: {
+    id: "accord",
+    name: "Accord",
+    label: "Accord — cooperative, everyone works toward one deal",
+    blurb: "Cooperative. All delegations work to reach an agreement. Not zero-sum: every team wins or loses together, though some win more than others. AI can play an antagonist Red Cell as well as the White Cell.",
+    scoring: "accord",
+    implemented: true,
+  },
+  standoff: {
+    id: "standoff",
+    name: "Standoff",
+    label: "Standoff — zero-sum, one side wins and one loses",
+    blurb: "Zero-sum, with one side winning and the other losing: a pure binary outcome. AI can play the White Cell, or a third party whose moves change what the two main cells do.",
+    scoring: "standoff",
+    implemented: false,
+  },
+  estimate: {
+    id: "estimate",
+    name: "Estimate",
+    label: "Estimate — one team manages an external crisis",
+    blurb: "A team faces an external crisis it has to address or manage, which may not be solvable. They succeed or they don't, and some scenarios allow an in-between. AI plays the antagonist and may play a White Cell role as well.",
+    scoring: "estimate",
+    implemented: false,
+  },
+};
+
+export const MODE_IDS = Object.keys(GAME_MODES);
+export const DEFAULT_MODE = "accord";
+
+/* The mode record for a cartridge. Falls back to accord so callers never have
+   to null-check; checkCartridge is what rejects an unknown mode. */
+export function modeOf(s) {
+  return GAME_MODES[s && s.mode] || GAME_MODES[DEFAULT_MODE];
+}
+
+/* Does the engine have a scoring rubric for this cartridge's game type?
+   The editor and the facilitator console both use this to say plainly when a
+   scenario can be run but not yet scored. */
+export function scoringReady(s) {
+  return modeOf(s).implemented === true;
+}
+
 /* ---- parsing ---- */
 
 export function parseCartridge(text) {
@@ -167,7 +224,13 @@ export function normalizeCartridge(raw) {
     catch { throw new CartridgeError("matrixB64 isn't valid base64-encoded JSON."); }
   }
   delete s.matrixB64;
-  s.mode ??= "accord";
+  /* Missing mode: an older cartridge, written before game types existed, and
+     every one of those is an accord. Present but odd: trimmed and lowercased
+     so "Standoff " matches, then left alone — checkCartridge rejects anything
+     that still isn't one of the three, rather than silently calling it an
+     accord and scoring it with the wrong rubric. */
+  if (s.mode == null || s.mode === "") s.mode = DEFAULT_MODE;
+  else if (typeof s.mode === "string") s.mode = s.mode.trim().toLowerCase();
   s.meta = isObj(s.meta) ? s.meta : {};
   s.scoring = { dealWeight: 0.8, credWeight: 0.2, mediatorClosureShare: 0.5, startCred: 50, ...(isObj(s.scoring) ? s.scoring : {}) };
   s.mechanics = { amendmentPolicy: "reconfirm", injectAckRequired: true, maxLiveDrafts: null, ...(isObj(s.mechanics) ? s.mechanics : {}) };
@@ -193,6 +256,12 @@ export function checkCartridge(s) {
   const hard = (text) => findings.push({ level: "hard", text });
   const findings = [];
   if (!isObj(s)) return [{ level: "hard", text: "A cartridge must be an object." }];
+
+  /* Game type first: it decides which scoring rubric the engine applies, so a
+     cartridge that doesn't name one the engine knows can't be scored at all. */
+  if (!MODE_IDS.includes(s.mode)) {
+    hard(`mode ${JSON.stringify(s.mode)} isn't a game type. Use one of: ${MODE_IDS.join(", ")}.`);
+  }
 
   const meta = s.meta || {};
   if (!meta.id || typeof meta.id !== "string") hard("meta.id is missing (a short id such as \"ind26\").");
@@ -322,13 +391,18 @@ export function designRules(s) {
   return findings;
 }
 
-/* One-line description for library listings. */
+/* One-line description for library listings. The game type leads, since it is
+   the first thing that decides how a scenario plays and how it is scored. */
 export function summarize(s) {
   const n = (x, one) => `${x} ${one}${x === 1 ? "" : "s"}`;
+  const mode = modeOf(s);
   return {
     title: s.meta.title,
+    mode: mode.id,
+    modeName: mode.name,
+    scoringReady: mode.implemented,
     delegations: s.delegations.map((d) => ({ id: d.id, name: d.name, flag: d.flag || "" })),
-    text: [n(s.delegations.length, "delegation"), n(s.issues.length, "issue"), n(s.injects.length, "inject")].join(" · "),
+    text: [mode.name, n(s.delegations.length, "delegation"), n(s.issues.length, "issue"), n(s.injects.length, "inject")].join(" · "),
   };
 }
 
@@ -366,6 +440,108 @@ export function blankCartridge(template) {
   const s = normalizeCartridge(template);
   s.meta = { ...s.meta, id: `sc${Date.now().toString(36).slice(-6)}`, title: "NEW SCENARIO", gateTagline: "NEW SCENARIO", projectorSubtitle: "NEW SCENARIO" };
   return s;
+}
+
+/* ---- guided setup ----
+   The questionnaire in ScenarioWizard.jsx collects plain answers; these turn
+   them into a cartridge. Kept here, beside the other builders, so the UI holds
+   no cartridge-shaping logic and this stays testable on its own. */
+
+/* An issue's options, one per line, blanks dropped. */
+export function optionLines(text) {
+  return String(text || "").split("\n").map((o) => o.trim()).filter(Boolean);
+}
+
+/* A delegation or issue id derived from what the professor typed. Ids are
+   referenced by the matrix, priorities and red lines, so they must match the
+   API's rule; the fallback keeps a cartridge valid when a name is punctuation
+   only or in a non-Latin script. */
+function slugify(name, fallback, taken) {
+  const base = String(name || "").trim().replace(/[^A-Za-z0-9_-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 40);
+  let id = DELEGATION_RE.test(base) && base.toLowerCase() !== "observer" ? base : fallback;
+  let n = 2;
+  while (taken.has(id)) { id = `${fallback}${n}`; n += 1; }
+  taken.add(id);
+  return id;
+}
+
+/* Answers in, cartridge out. Anything the wizard doesn't ask about is left to
+   editableCartridge, which fills the engine's defaults (postures, press
+   windows, a neutral mood).
+
+   Rankings are deliberately NOT asked for: that is one question per
+   delegation per issue per option, and the editor's Rankings grid is the
+   right place for it. Every delegation starts ranking the options in listed
+   order — structurally valid, and deliberately uninteresting, so the review
+   step and the editor's design notes both point at it. */
+export function cartridgeFromAnswers(a) {
+  const delTaken = new Set();
+  const delegations = (a.delegations || []).map((d, i) => {
+    const id = slugify(d.name, `Delegation${i + 1}`, delTaken);
+    const name = String(d.name || "").trim() || id;
+    return {
+      id,
+      name,
+      flag: String(d.flag || "").trim() || "🏳️",
+      mediator: !!d.mediator,
+      ministry: {
+        wire: `${name.toUpperCase()} — FOREIGN MINISTRY`,
+        title: "Foreign Ministry",
+        speaker: `The Foreign Ministry of ${name}`,
+      },
+      priority: null,
+      noDealPct: 30,
+      redLines: {},
+      domestic: { label: `${name} public`, dispatch: "", moods: {} },
+    };
+  });
+
+  const issTaken = new Set();
+  const issues = (a.issues || []).map((iss, i) => {
+    const label = String(iss.label || "").trim() || `Issue ${i + 1}`;
+    const options = optionLines(iss.options);
+    return {
+      id: slugify(iss.label, `issue${i + 1}`, issTaken),
+      label: label.toUpperCase(),
+      short: label,
+      type: "ranked",
+      options,
+      pillOptions: options.map((o) => (o.length > 14 ? `${o.slice(0, 13)}…` : o)),
+    };
+  });
+
+  const matrix = {};
+  for (const d of delegations) {
+    matrix[d.id] = {};
+    for (const iss of issues) matrix[d.id][iss.id] = iss.options.map((_, k) => k + 1);
+  }
+
+  const title = String(a.title || "").trim() || "NEW SCENARIO";
+  return editableCartridge({
+    mode: a.mode,
+    meta: {
+      id: String(a.metaId || "").trim() || `sc${Date.now().toString(36).slice(-6)}`,
+      title: title.toUpperCase(),
+      gateTagline: title.toUpperCase(),
+      projectorSubtitle: title.toUpperCase(),
+      clockLabel: "TIME TO CLOSE",
+      deadlineMinutes: Number(a.minutes) || 60,
+      adoptedBanner: "✦ AGREEMENT ADOPTED ✦",
+      collapseBanner: "✦ NO AGREEMENT ✦",
+      collapseNote: "The session closed without an agreement.",
+    },
+    delegations,
+    issues,
+    matrix,
+    publicDiplomacy: {
+      enabled: true,
+      scoringContext: String(a.context || "").trim() || title.toLowerCase(),
+      moods: { NEUTRAL: { dispatch: "Public attention is steady.", we: 1, wl: 1, wp: 1, favored: [], penalized: [] } },
+      defaultMood: "NEUTRAL",
+    },
+    injects: [],
+    mechanics: { amendmentPolicy: "reconfirm", injectAckRequired: true, maxLiveDrafts: 4, redLineMode: "hard" },
+  });
 }
 
 export function addDelegation(s0) {

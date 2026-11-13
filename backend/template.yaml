@@ -38,12 +38,13 @@ Resources:
       DefaultRouteSettings:
         ThrottlingBurstLimit: 200
         ThrottlingRateLimit: 100
-      # /ai is public and calls Bedrock, so it keeps the tight cap.
+      # /ai calls Bedrock on every statement filed, so it keeps the tight cap
+      # even though it now requires a signed-in user.
       RouteSettings:
         "POST /ai":
           ThrottlingBurstLimit: 20
           ThrottlingRateLimit: 10
-      # Opt-in per route (Auth: Authorizer: CognitoJwt); /ai stays public.
+      # Opt-in per route (Auth: Authorizer: CognitoJwt). Every route opts in.
       Auth:
         Authorizers:
           CognitoJwt:
@@ -365,6 +366,11 @@ Resources:
             ApiId: !Ref Api
             Path: /ai
             Method: POST
+            # Any signed-in user, student or professor: students call this
+            # whenever they file a communique. Without it the endpoint is open
+            # to anyone who finds the URL, billed to this account's Bedrock.
+            Auth:
+              Authorizer: CognitoJwt
 
   # Static frontend: private bucket, served only through CloudFront (OAC).
   SiteBucket:

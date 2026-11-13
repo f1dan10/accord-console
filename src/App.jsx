@@ -3,10 +3,11 @@ import {
   authConfigured, currentUser, onAuthChange, signIn, signUp, signOut,
   confirmSignUp, resendCode, forgotPassword, resetPassword,
 } from "./auth.js";
-import { api } from "./api.js";
+import { api, API_CONFIGURED } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
 import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge } from "./cartridge.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
+import ScenarioWizard from "./ScenarioWizard.jsx";
 
 /* ============================================================
    PYRSIS ACCORD CONSOLE — engine v1.5 (scenario-agnostic) · the build that ran at Brown, 28 Sep 2026 · cartridge slot holds a runnable template
@@ -371,10 +372,13 @@ function receptionLabel(net) {
    It is inserted into release builds from a private file. The placeholder keeps the
    grader working end to end: three dimensions, each scored 0–5, plus relevance 0–3. */
 const RUBRIC_TEXT = "DIMENSION A (placeholder): 0-5, how well the statement is supported.\nDIMENSION B (placeholder): 0-5, how well the statement is argued.\nDIMENSION C (placeholder): 0-5, how well the statement resonates with its audience.";
-/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is chosen server-side. */
-const AI_URL = `${import.meta.env.VITE_API_URL}/ai`;
+/* Claude calls go through our backend (Lambda -> Amazon Bedrock); the model is
+   chosen server-side. They go through api(), like every other call, so each one
+   carries the signed-in user's token: /ai requires it, and api() also refreshes
+   an expiring token mid-game rather than letting a long session start failing. */
 const RUBRIC_LABELS = ["Dimension A", "Dimension B", "Dimension C"];
 async function scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars }) {
+  if (!API_CONFIGURED) throw new Error("ai-not-configured");
   const exBlock = exemplars && exemplars.length
     ? `\n\nCALIBRATION EXAMPLES \u2014 these were graded by the head facilitator. Match this standard exactly.\n` +
       exemplars.map((x, i) =>
@@ -391,12 +395,7 @@ Communiqué text:
 """${text}"""${exBlock}
 
 Respond ONLY with a JSON object, no preamble, no markdown fences: {"e": n, "l": n, "p": n, "ad_hominem": bool, "relevance": n}`;
-  const response = await fetch(AI_URL, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ prompt, max_tokens: 1000 }),
-  });
-  const data = await response.json();
+  const data = await api("POST", "/ai", { prompt, max_tokens: 1000 });
   const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join("\n");
   const clean = txt.replace(/```json|```/g, "").trim();
   const parsed = JSON.parse(clean);
@@ -797,8 +796,14 @@ async function opFileCommunique(team, { posture, subject, subjectLabel, text, mo
   try {
     const exemplars = await sGet(K.exemplars, []);
     sx = await scoreCommunique({ team, posture, subjectLabel, text, moodKey, exemplars });
-  } catch {
-    sx = { e: 2, l: 2, p: 2, ad_hominem: false };
+  } catch (err) {
+    /* Never lose a filing to a scoring failure — but say so. A neutral 2/2/2
+       nets zero, so an unnoticed run of these leaves credibility flat all game
+       and the public-diplomacy half of the scenario does nothing. `unscored`
+       rides into the session export, so a debrief can tell these apart from
+       statements Claude actually graded. */
+    console.warn("[accord] statement scoring failed — applying neutral placeholder:", err);
+    sx = { e: 2, l: 2, p: 2, ad_hominem: false, unscored: true };
   }
   const { net } = computeNet(sx, posture, moodKey);
   /* Atomic over pub (credibility + sentiment) AND comms scoring — computed
@@ -1084,17 +1089,16 @@ async function composeAiCommunique(team, { subject, posture, leadTeam, moodDispa
     : subject.stance === "for"
       ? `${MINISTRY[team].speaker} welcomes the ${leadTeam} text as a serious basis for agreement, and calls on all delegations to move from posturing to signature.`
       : `${MINISTRY[team].speaker} cannot accept the ${leadTeam} text as drafted${worstIss ? `, above all on ${worstIss.label.toLowerCase().replace(/\?$/, "")}` : ""}. A durable agreement will not be built on terms our public cannot defend.`;
+  if (!API_CONFIGURED) return fallback;
   try {
     const prompt = `You write one official communiqué (max 380 characters, no quotation marks around it, no preamble) for ${MINISTRY[team].wire} in ${PD.scoringContext}. Posture: ${posture}. Subject: ${subjectLabel}. Current press climate: "${moodDispatch}". Speak in the institutional first-person plural of ${MINISTRY[team].speaker}. Be specific and rhetorically strong — cite a principle or fact, reason clearly, and match the public temperature. Output ONLY the statement text.`;
-    const res = await fetch(AI_URL, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ prompt, max_tokens: 300 }),
-    });
-    const data = await res.json();
+    const data = await api("POST", "/ai", { prompt, max_tokens: 300 });
     const txt = (data.content || []).filter((b) => b.type === "text").map((b) => b.text).join(" ").trim();
     return txt ? txt.slice(0, 400) : fallback;
-  } catch { return fallback; }
+  } catch (err) {
+    console.warn("[accord] AI communiqué failed, using the written fallback:", err);
+    return fallback;
+  }
 }
 
 /* ---- Audio ---- */
@@ -3895,6 +3899,7 @@ const EDITOR_UI = { GOLD, PAPER, CARD, BTN_PRIMARY, BTN_SECONDARY, INPUT: AUTH_I
 function ScenarioLibrary({ me }) {
   const [list, setList] = useState(null);
   const [editing, setEditing] = useState(null); // { initial, replacing }
+  const [wizard, setWizard] = useState(false);  // guided setup, hands off to the editor
   const [pending, setPending] = useState(null); // { cartridge, findings, fileName, replacing? }
   const [busy, setBusy] = useState("");
   const [err, setErr] = useState("");
@@ -3970,13 +3975,20 @@ function ScenarioLibrary({ me }) {
         {editing ? (
           <ScenarioEditor key={editing.replacing?.scenarioId || "new"} initial={editing.initial} replacing={editing.replacing} ui={EDITOR_UI}
             onSaved={saved} onCancel={() => setEditing(null)} />
+        ) : wizard ? (
+          /* Guided setup builds the cartridge, then hands it to the editor —
+             it never saves on its own, so the rankings get a pass first. */
+          <ScenarioWizard ui={EDITOR_UI} onCancel={() => setWizard(false)}
+            onBuilt={(cartridge) => { setWizard(false); setDone(""); setPending(null); setEditing({ initial: cartridge, replacing: null }); }} />
         ) : <>
         <div className="flex items-center gap-3 flex-wrap mb-3">
+          <button onClick={() => { setDone(""); setPending(null); setWizard(true); }}
+            className="px-3 py-2 rounded text-sm font-bold" style={BTN_PRIMARY}>Guided setup</button>
           <button onClick={() => { setDone(""); setPending(null); setEditing({ initial: blankCartridge(SCENARIO), replacing: null }); }}
-            className="px-3 py-2 rounded text-sm font-bold" style={BTN_PRIMARY}>New scenario</button>
+            className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>New scenario</button>
           {fileInput((f) => pick(f), "Upload cartridge", false)}
           <button onClick={() => downloadJson("template.json", normalizeCartridge(SCENARIO))} className="px-3 py-2 rounded text-sm" style={BTN_SECONDARY}>Download template</button>
-          <span className="text-xs" style={{ opacity: 0.7 }}>Build one in the editor, or upload a .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you save.</span>
+          <span className="text-xs" style={{ opacity: 0.7 }}>Answer a few questions and we'll build the cartridge, start from a blank one in the editor, or upload a .js cartridge (like islamabad_scenario.js) or .json. Every professor can use what you save.</span>
         </div>
         {pending && <CartridgePreview pending={pending} busy={busy === "save"} onSave={save} onCancel={() => setPending(null)}
           onEdit={() => { setEditing({ initial: pending.cartridge, replacing: pending.replacing }); setPending(null); }} />}

@@ -8,7 +8,7 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
 import { api } from "./api.js";
 import {
-  checkCartridge, summarize, parseCartridge, normalizeCartridge,
+  checkCartridge, summarize, parseCartridge, normalizeCartridge, GAME_MODES, MODE_IDS, modeOf,
   addDelegation, renameDelegation, removeDelegation,
   addIssue, renameIssue, removeIssue, setIssueType, addOption, removeOption, moveOption, setRank,
   renameMood, removeMood, setPostures, moveItem, editableCartridge,
@@ -230,8 +230,20 @@ const confirmRemove = (what) => window.confirm(`Remove ${what}? Anything that re
 /* ---- tabs ---- */
 function Basics({ s, edit, ui }) {
   const m = s.meta, sc = s.scoring, mech = s.mechanics;
+  const mode = modeOf(s);
   return (
     <>
+      {/* Game type leads: it picks the scoring rubric and decides what winning
+          means, so it is the first thing to settle about a scenario. */}
+      <Pick ui={ui} label="GAME TYPE" hint={mode.blurb} value={mode.id}
+        options={MODE_IDS.map((id) => [id, GAME_MODES[id].label])}
+        onChange={(v) => edit((d) => { d.mode = v; })} />
+      {!mode.implemented && (
+        <div className="mb-3 p-2 rounded text-xs" role="status" style={{ border: `1px solid ${ui.GOLD}` }}>
+          The engine can run a {mode.name.toLowerCase()} game but has no scoring rubric for it yet, so it won't
+          produce final scores. Everything else works.
+        </div>
+      )}
       <Text ui={ui} label="TITLE" value={m.title} onChange={(v) => edit((d) => { d.meta.title = v; })} />
       <Row>
         <Text ui={ui} label="LOGIN / GATE TAGLINE" value={m.gateTagline} onChange={(v) => edit((d) => { d.meta.gateTagline = v; })} />
