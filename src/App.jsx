@@ -1266,6 +1266,8 @@ button:focus-visible { outline: 2px solid #C1442E; outline-offset: 2px; }
 input, textarea, select { font-family: inherit; max-width: 100%; }
 /* Never scroll sideways: the page fits the viewport; anything wider scrolls inside its own box. */
 html, body, #root { max-width: 100vw; overflow-x: clip; }  /* clip, not hidden: hidden would stop position: sticky */
+[id^="sec-"], [id^="pz-"] { scroll-margin-top: 4.5rem; }
+.pz-sidenav button:not(:disabled):hover { box-shadow: none; background: rgba(37,41,42,.08); }
 * { min-width: 0; }
 img, svg, video { max-width: 100%; }
 pre, code { white-space: pre-wrap; word-break: break-word; }
@@ -1725,6 +1727,76 @@ function PlayersPanel({ game, aiCtl }) {
       )}
       {err && <div className="mt-2 text-sm font-bold" role="alert" style={{ color: RED }}>{err}</div>}
     </div>
+  );
+}
+
+/* v1.7 — Navigation. The facilitator console stays one scrolling page; a left
+   sidebar (wide screens) jumps to its sections and marks where you are, and a
+   pinned bar keeps the clock, pause and press-window status in view. */
+function useScrollSpy(ids) {
+  const [active, setActive] = useState(ids[0] || null);
+  const lockUntil = React.useRef(0);
+  /* A section picked from the sidebar stays marked until the reader scrolls
+     well away: two sections can sit side by side, and position alone can't
+     tell which of them was meant. */
+  const pinned = React.useRef(null);
+  const key = ids.join("|");
+  useEffect(() => {
+    let timer = 0;
+    const measure = () => {
+      timer = 0;
+      if (Date.now() < lockUntil.current) return;
+      if (pinned.current) {
+        if (pinned.current.y == null) pinned.current.y = window.scrollY;
+        if (Math.abs(window.scrollY - pinned.current.y) < 240) return;
+        pinned.current = null;
+      }
+      let best = null, bestTop = -Infinity;
+      for (const id of key.split("|")) {
+        const el = document.getElementById(id);
+        if (!el) continue;
+        const top = el.getBoundingClientRect().top - 140;
+        if (top <= 0 && top > bestTop) { best = id; bestTop = top; }
+      }
+      if (best) setActive(best);
+    };
+    /* A short timer, not requestAnimationFrame: frames stall in a background tab. */
+    const onScroll = () => { if (!timer) timer = setTimeout(measure, 80); };
+    window.addEventListener("scroll", onScroll, { passive: true });
+    onScroll();
+    return () => { window.removeEventListener("scroll", onScroll); if (timer) clearTimeout(timer); };
+  }, [key]);
+  const jump = (id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    lockUntil.current = Date.now() + 900;
+    pinned.current = { id, y: null };
+    setActive(id);
+    el.scrollIntoView({ behavior: "smooth", block: "start" });
+  };
+  return [active, jump];
+}
+function SideNav({ groups, badges }) {
+  const ids = groups.flatMap(([, items]) => items.map(([id]) => id));
+  const [active, jump] = useScrollSpy(ids);
+  return (
+    <nav aria-label="Console sections" className="hidden lg:block shrink-0 pz-sidenav"
+      style={{ width: "13.5rem", position: "sticky", top: "3.6rem", alignSelf: "flex-start", maxHeight: "calc(100vh - 3.6rem)", overflowY: "auto", padding: "1rem 0.75rem", textAlign: "left" }}>
+      {groups.map(([label, items]) => (
+        <div key={label} className="mb-4">
+          <div className="text-xs pz-label mb-1 px-2" style={{ opacity: 0.6, letterSpacing: "0.12em" }}>{label.toUpperCase()}</div>
+          {items.map(([id, text]) => (
+            <button key={id} onClick={() => jump(id)} aria-current={active === id ? "true" : undefined}
+              className="w-full flex items-center justify-between gap-2 px-2 py-1.5 rounded text-sm"
+              style={{ boxShadow: "none", textAlign: "left", fontFamily: BODY_HI,
+                background: active === id ? CHARCOAL : "transparent", color: active === id ? GOLD : CHARCOAL }}>
+              <span>{text}</span>
+              {badges && badges[id] ? <span className="px-1.5 rounded-full text-xs font-bold" style={{ background: RED, color: PAPER }}>{badges[id]}</span> : null}
+            </button>
+          ))}
+        </div>
+      ))}
+    </nav>
   );
 }
 
@@ -2273,9 +2345,16 @@ function Facilitator({ sh, game, onExit }) {
   };
 
   const firedIds = new Set(injects.map((j) => String(j.id).split("-")[0]));
+  /* Delegations whose latest message to the gamemaster has no reply yet. */
+  const awaitingN = TEAMS.filter((t) => { const th = gmThreads[t] || []; const lt = [...th].reverse().find((m) => m.from === "team"); return lt && !th.some((m) => m.from === "gm" && m.ts > lt.ts); }).length;
+  const navGroups = [
+    ["Run the game", [["sec-clock", "Clock and session"], schedItems.length ? ["pz-schedule", "Schedule"] : null, ["sec-injects", "Injects"], ["pz-messages", "Messages"]].filter(Boolean)],
+    ["Watch", [["sec-standings", "Standings"], ["pz-injects", "Filings"], ["sec-cred", "Credibility and mood"]]],
+    ["Manage", [game ? ["sec-players", "Players"] : null, ["sec-seats", "Seats and overrides"], designer ? ["sec-calibration", "Calibration"] : null].filter(Boolean)],
+  ];
 
   return (
-    <div className="min-h-screen p-6" style={{ background: PAPER, color: CHARCOAL, fontFamily: BODY_FONT }}>
+    <div className="min-h-screen" style={{ background: PAPER, color: CHARCOAL, fontFamily: BODY_FONT, textAlign: "left" }}>
       {gmNote && (
         <div className="fixed left-1/2 z-50 px-4 py-2 rounded font-bold text-sm" role="status"
           style={{ top: 12, transform: "translateX(-50%)", background: gmNote.kind === "err" ? RED : CHARCOAL, color: gmNote.kind === "err" ? PAPER : GOLD, fontFamily: BODY_HI, maxWidth: "90vw" }}>
@@ -2285,22 +2364,35 @@ function Facilitator({ sh, game, onExit }) {
       {busy && (
         <div className="fixed right-4 z-50 px-3 py-1 rounded text-xs" style={{ top: 12, background: LIGHTGOLD, color: CHARCOAL, fontFamily: MONO_FONT }}>working: {busy}…</div>
       )}
-      <div className="flex justify-between items-baseline mb-1">
-        <div><Wordmark h="24px" /> <span className="text-sm opacity-60 ml-2">Facilitator Console · {S.meta.title}</span></div>
-        <div className="text-right">
-          <div className="text-3xl font-bold tabular-nums" style={{ color: rem < 600000 ? RED : CHARCOAL }}>{fmt(rem)}</div>
-          <span className="inline-flex items-center gap-3">
-            {designer && <button onClick={async () => { try { await window.storage.delete("pz-designer", false); } catch {} setDesigner(false); note("Designer view off on this account. Enter the designer key again to restore it."); }}
+      <div className="sticky top-0 z-30 flex flex-wrap items-center gap-x-4 gap-y-1 px-4 py-2"
+        style={{ background: CHARCOAL, color: PAPER, borderBottom: `3px solid ${GOLD}` }}>
+        <span className="text-2xl font-bold tabular-nums" style={{ color: rem < 600000 ? "#ff8a70" : GOLD, fontFamily: MONO_FONT }}>{fmt(rem)}</span>
+        <span className="text-xs font-bold" style={{ fontFamily: MONO_FONT, color: flags.paused ? "#ff8a70" : clock.running ? "#4caf7d" : "#ff8a70" }}>
+          {flags.paused ? "SESSION PAUSED" : clock.running ? "RUNNING" : "STOPPED"}</span>
+        {flags.paused
+          ? <button onClick={resumeSession} disabled={!!busy} className="px-3 py-1 rounded font-bold text-sm" style={{ background: GOLD, color: CHARCOAL }}>▶ Resume session</button>
+          : clock.running
+            ? <button onClick={pauseSession} disabled={!!busy} className="px-3 py-1 rounded font-bold text-sm" style={{ background: PAPER, color: CHARCOAL }}>❚❚ Pause session</button>
+            : <button onClick={() => act("Start", start)} disabled={!!busy || rem <= 0} className="px-3 py-1 rounded font-bold text-sm" style={{ background: GOLD, color: CHARCOAL }}>▶ Start clock</button>}
+        <span className="text-xs px-2 py-1 rounded" style={winOpen ? { background: GREEN, color: "white", fontWeight: 700 } : { background: "#3a4142", color: PAPER }}>
+          {winOpen ? `Press window ${pub.window.n} open · ${fmt(pub.window.endsAt - now)}` : `Press windows ${pub.window.n}/${TOTAL_WINDOWS} used`}</span>
+        {schedNext && <span className="text-xs" style={{ opacity: 0.85 }}>Next{schedAuto ? "" : " (manual)"}: {({ inject: `inject ${schedNext.inject}`, window: "press window", announce: "announcement", note: "facilitator note" })[scheduleKind(schedNext)]} at {schedNext.at}:00</span>}
+        {awaitingN > 0 && <button onClick={() => { const el = document.getElementById("pz-messages"); if (el) el.scrollIntoView({ behavior: "smooth", block: "start" }); }}
+          className="px-2 py-1 rounded text-xs font-bold" style={{ background: RED, color: PAPER }}>● {awaitingN} awaiting your reply</button>}
+        <span className="inline-flex items-center gap-3" style={{ marginLeft: "auto" }}>
+          <span className="text-xs hidden md:inline" style={{ opacity: 0.6 }}>Facilitator · {S.meta.title}</span>
+          {designer && <button onClick={async () => { try { await window.storage.delete("pz-designer", false); } catch {} setDesigner(false); note("Designer view off on this account. Enter the designer key again to restore it."); }}
               className="px-2 py-1 rounded text-xs" style={{ background: PLATE, color: RED, fontFamily: MONO_FONT }} title="Hide scoring detail on this account">designer view · off</button>}
-            <TextSize /><SyncDot sync={sh.sync} />
-          </span>
-        </div>
+          <TextSize dark /><SyncDot sync={sh.sync} dark />
+        </span>
       </div>
-      <GoldRule />
-      {game && <PlayersPanel game={game} aiCtl={{ ...aiCtl, ...seatLocal }} />}
+      <div className="lg:flex lg:items-start">
+      <SideNav groups={navGroups} badges={{ "pz-messages": awaitingN, "pz-schedule": schedItems.length - schedFired.length > 0 && schedAuto === false ? "manual" : 0 }} />
+      <div className="flex-1 p-6" style={{ minWidth: 0, maxWidth: "82rem" }}>
+      {game && <div id="sec-players"><PlayersPanel game={game} aiCtl={{ ...aiCtl, ...seatLocal }} /></div>}
 
       {/* v1.5 — COMMAND PANEL: everything the GM touches during play, above the fold */}
-      <div className="mt-3 p-4 rounded" style={{ background: PLATE }}>
+      <div id="sec-clock" className="mt-3 p-4 rounded" style={{ background: PLATE }}>
         <div className="flex flex-wrap items-start gap-x-10 gap-y-4">
           <div>
             <div className="text-xs pz-label mb-1" style={{ opacity: 0.7 }}>{S.meta.clockLabel}</div>
@@ -2424,6 +2516,7 @@ function Facilitator({ sh, game, onExit }) {
         </details>
       )}
 
+      <div id="sec-standings" />
       {(() => {
         const adoptedP = flags.adoptedId ? props.find((p) => p.id === flags.adoptedId) : null;
         const leadP = leadingProposal(props, endo);
@@ -2570,7 +2663,7 @@ function Facilitator({ sh, game, onExit }) {
             </div>
           )}
 
-          <h3 className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>INJECT LIBRARY <span className="font-normal text-xs opacity-60">(some shift the mood automatically)</span></h3>
+          <h3 id="sec-injects" className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>INJECT LIBRARY <span className="font-normal text-xs opacity-60">(some shift the mood automatically)</span></h3>
           <div className="space-y-2 max-h-96 overflow-y-auto pr-1">
             {INJECT_LIB.map((j) => (
               <div key={j.id} className="p-2 rounded flex gap-3 items-start" style={{ background: firedIds.has(j.id) ? LIGHTGOLD : "white", border: `1px solid ${LIGHTGOLD}` }}>
@@ -2602,7 +2695,7 @@ function Facilitator({ sh, game, onExit }) {
 
         </div>
         <div>
-          <h3 className="font-bold tracking-wide mb-2">CREDIBILITY</h3>
+          <h3 id="sec-cred" className="font-bold tracking-wide mb-2">CREDIBILITY</h3>
           <div className="space-y-1.5">{TEAMS.map((t) => <CredBar key={t} team={t} val={pub.cred[t] ?? S.scoring.startCred} />)}</div>
 
           {/* ---- Credibility override ---- */}
@@ -2707,7 +2800,7 @@ function Facilitator({ sh, game, onExit }) {
 
         </div>
         <div>
-          <h3 className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>SEAT CONTROL <span className="font-normal text-xs opacity-60">(per session — AI seats play by their real matrix and act only while this console is open)</span></h3>
+          <h3 id="sec-seats" className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>SEAT CONTROL <span className="font-normal text-xs opacity-60">(per session — AI seats play by their real matrix and act only while this console is open)</span></h3>
           <div className="grid grid-cols-2 gap-1.5 mb-6">
             {TEAMS.map((t) => (
               <SeatToggle key={t} team={t} value={seatLocal[t] ?? aiCtl[t]} onToggle={() => toggleSeat(t)} />
@@ -2804,7 +2897,7 @@ function Facilitator({ sh, game, onExit }) {
 
         </div>
       </div>
-      {designer && <details className="mt-6">
+      {designer && <details id="sec-calibration" className="mt-6">
         <summary className="cursor-pointer font-bold tracking-wide" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>CALIBRATION LAB & TEST BENCH <span className="font-normal text-xs opacity-60">(authoring tools; not used during play)</span></summary>
         <div className="mt-2">
           <h3 className="font-bold tracking-wide mt-6 mb-2">CALIBRATION LAB <span className="font-normal text-xs opacity-60">(tap a filing to see the full scoring math)</span></h3>
@@ -2872,6 +2965,8 @@ function Facilitator({ sh, game, onExit }) {
           </div>
         </div>
       </details>}
+      </div>
+      </div>
     </div>
   );
 }
