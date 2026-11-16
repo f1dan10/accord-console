@@ -5,7 +5,7 @@ import {
 } from "./auth.js";
 import { api, API_CONFIGURED } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
-import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge, rankPoints } from "./cartridge.js";
+import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge, rankPoints, scheduleKind } from "./cartridge.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
 import ScenarioWizard from "./ScenarioWizard.jsx";
 
@@ -24,6 +24,14 @@ import ScenarioWizard from "./ScenarioWizard.jsx";
    Optional per-delegation config: defaultControl: "ai" | "human"
    (initial toggle state only; the facilitator's choice governs).
 
+
+   v1.6 — MIT play test build (Nov 2026).
+     · Ranked scoring: a delegation's last choice now earns 0 (was weight / n),
+       matching the Brown build. rankPoints() in cartridge.js.
+     · Cartridges may give rankings per delegation (delegations[].row) instead
+       of a top-level matrix, and moods without we/wl/wp (graded evenly).
+     · Automatic schedule: cartridge schedule.items fire injects, press windows,
+       timed announcements and facilitator notes from the clock.
 
    v1.5 — Brown / MIT build (Sep 2026). New, each switchable by cartridge:
      · Session pause / resume: locks team consoles, suspends clock and press
@@ -2095,6 +2103,77 @@ function Facilitator({ sh, game, onExit }) {
     }
   });
 
+  /* ---- v1.6 — Automatic schedule (cartridge `schedule.items`) ----
+     Each item fires once when the clock reaches its `at` (minutes remaining):
+     an inject, a press window, a timed announcement, or a facilitator-only
+     note. Fired ids live in the game doc (flags.schedFired) so a reload never
+     re-fires. Like AI seats, the schedule runs only while this console is open. */
+  const schedItems = (S.schedule && S.schedule.items) || [];
+  const schedAuto = flags.schedAuto ?? !!(S.schedule && S.schedule.autoByDefault);
+  const schedFired = flags.schedFired || [];
+  const schedBusy = React.useRef(false);
+  /* id -> when this console started it; covers the moment before the doc echoes back. */
+  const schedSeen = React.useRef(new Map());
+  const schedPending = (it) => Date.now() - (schedSeen.current.get(it.id) || 0) < 15000;
+  const schedText = (it) => {
+    const kind = scheduleKind(it);
+    if (kind === "inject") { const j = INJECT_LIB.find((x) => x.id === it.inject); return `${it.inject} · ${j ? j.title : "inject"}`; }
+    if (kind === "window") return "Press window opens";
+    return String(it[kind] ?? "");
+  };
+  const markScheduled = async (it) => {
+    let fresh = false;
+    const ok = await writeDoc((d) => {
+      const f = d[K.flags] || DEFAULT_FLAGS;
+      const done = f.schedFired || [];
+      fresh = !done.includes(it.id);
+      if (fresh) d[K.flags] = { ...f, schedFired: [...done, it.id] };
+      return d;
+    });
+    return ok && fresh;
+  };
+  const runScheduled = async (it) => {
+    schedSeen.current.set(it.id, Date.now());
+    if (!(await markScheduled(it))) { await pull(); return; }
+    const kind = scheduleKind(it);
+    if (kind === "inject") {
+      const j = INJECT_LIB.find((x) => x.id === it.inject);
+      if (j) await fire(j);
+    } else if (kind === "window") {
+      if (pub.window.open) await closeWindow();
+      await openWindow();
+    } else if (kind === "announce") {
+      await act("announce", async () => {
+        const aid = `A-${it.id}-${Date.now()}`;
+        const mins = Number(it.minutes) > 0 ? Number(it.minutes) : 0;
+        await sUpdate(K.ann, [],
+          (a) => (a.some((x) => x.id === aid) ? a : [...a, { id: aid, text: String(it.announce), ts: Date.now(), ttlMs: mins ? mins * 60 * 1000 : null }]),
+          (a) => a.some((x) => x.id === aid));
+      }, "Scheduled announcement pinned");
+    } else {
+      await pull();
+      note(`Schedule note: ${it.note}`);
+    }
+  };
+  const skipScheduled = (it) => act("schedule", async () => { schedSeen.current.set(it.id, Date.now()); await markScheduled(it); }, "Skipped");
+  const toggleSchedAuto = () => act("schedule", () => writeDoc((d) => {
+    const f = d[K.flags] || DEFAULT_FLAGS;
+    d[K.flags] = { ...f, schedAuto: !(f.schedAuto ?? !!(S.schedule && S.schedule.autoByDefault)) };
+    return d;
+  }), schedAuto ? "Schedule set to manual" : "Schedule set to automatic");
+  const schedLive = schedItems.length > 0 && schedAuto && clock.running && !flags.paused && !flags.adoptedId && !flags.collapsed;
+  const schedNext = schedItems.find((it) => !schedFired.includes(it.id)) || null;
+  useEffect(() => {
+    if (!schedLive || schedBusy.current || busy) return;
+    /* A scheduled window that has run out is closed here, so non-filers are
+       penalized without the facilitator watching the timer. */
+    const expired = pub.window.open && pub.window.endsAt && pub.window.endsAt <= now;
+    const due = schedItems.find((it) => !schedFired.includes(it.id) && !schedPending(it) && rem <= it.at * 60000);
+    if (!expired && !due) return;
+    schedBusy.current = true;
+    (expired ? closeWindow() : runScheduled(due)).catch(() => {}).finally(() => { schedBusy.current = false; });
+  }, [now]); // eslint-disable-line react-hooks/exhaustive-deps
+
   const reveal = () => act("reveal", async () => {
     const f = await sGet(K.flags, DEFAULT_FLAGS);
     await sSet(K.flags, { ...f, revealed: !f.revealed });
@@ -2251,7 +2330,7 @@ function Facilitator({ sh, game, onExit }) {
           Close window (penalize non-filers)
         </button>
       </div>
-      {winOpen && <div className="text-sm mt-1 font-bold" style={{ color: RED }}>Window {pub.window.n} open — {fmt(pub.window.endsAt - now)} left. Close it manually when time expires.</div>}
+      {winOpen && <div className="text-sm mt-1 font-bold" style={{ color: RED }}>Window {pub.window.n} open — {fmt(pub.window.endsAt - now)} left. {schedLive ? "The schedule closes it when time expires." : "Close it manually when time expires."}</div>}
 
           </div>
           <div>
@@ -2446,6 +2525,50 @@ function Facilitator({ sh, game, onExit }) {
             })}
             {comms.length === 0 && <div className="opacity-60 italic">No communiqués filed yet.</div>}
           </div>
+
+          {schedItems.length > 0 && (
+            <div className="mb-6" id="pz-schedule">
+              <div className="flex flex-wrap items-center gap-2 mb-2">
+                <h3 className="font-bold tracking-wide" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>SCHEDULE</h3>
+                <button onClick={toggleSchedAuto} disabled={!!busy} className="px-2 py-1 rounded text-xs font-bold"
+                  style={schedAuto ? { background: GREEN, color: "white" } : { background: PLATE, color: CHARCOAL, border: `1px solid ${GOLD}` }}>
+                  {schedAuto ? "AUTO ON" : "AUTO OFF"}</button>
+                <span className="text-xs opacity-70">
+                  {!schedAuto ? "Fire each item by hand below."
+                    : schedLive ? "Running from the clock. Keep this console open in one tab."
+                    : "Starts when the clock is running."}
+                </span>
+              </div>
+              <div className="space-y-1 max-h-80 overflow-y-auto pr-1">
+                {schedItems.map((it) => {
+                  const kind = scheduleKind(it);
+                  const done = schedFired.includes(it.id);
+                  const next = !done && schedNext && schedNext.id === it.id;
+                  const j = kind === "inject" ? INJECT_LIB.find((x) => x.id === it.inject) : null;
+                  const shifts = j && j.domesticShift ? Object.entries(j.domesticShift).map(([t, m]) => `${t} → ${m}`).join(", ") : "";
+                  return (
+                    <div key={it.id} className="p-2 rounded flex gap-2 items-start text-xs"
+                      style={{ background: done ? "#ece7da" : next ? LIGHTGOLD : "white", border: `1px solid ${next ? GOLD : LIGHTGOLD}`, opacity: done ? 0.65 : 1 }}>
+                      <span className="font-bold shrink-0" style={{ fontFamily: MONO_FONT, width: "3.2em" }}>{it.at}:00</span>
+                      <span className="shrink-0 pz-label opacity-70" style={{ fontFamily: MONO_FONT, width: "5.5em" }}>{String(kind || "").toUpperCase()}</span>
+                      <span className="flex-1" style={{ textAlign: "left" }}>
+                        {schedText(it)}
+                        {shifts && <span className="block" style={{ color: "#a07800" }}>Set home mood by hand: {shifts}</span>}
+                      </span>
+                      {done
+                        ? <span className="shrink-0 font-bold opacity-70">DONE</span>
+                        : <span className="shrink-0 flex gap-1">
+                            <button onClick={() => runScheduled(it)} disabled={!!busy} className="px-2 py-0.5 rounded font-bold"
+                              style={{ background: CHARCOAL, color: PAPER }}>{next ? "Fire now" : "Fire"}</button>
+                            <button onClick={() => skipScheduled(it)} disabled={!!busy} className="px-2 py-0.5 rounded font-bold"
+                              style={{ background: PLATE, color: CHARCOAL, border: `1px solid ${LIGHTGOLD}` }}>Skip</button>
+                          </span>}
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
 
           <h3 className="font-bold tracking-wide mb-2" style={{ fontFamily: HEAD_FONT, letterSpacing: "0.06em" }}>INJECT LIBRARY <span className="font-normal text-xs opacity-60">(some shift the mood automatically)</span></h3>
           <div className="space-y-2 max-h-96 overflow-y-auto pr-1">

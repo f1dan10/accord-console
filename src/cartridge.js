@@ -256,6 +256,17 @@ export function normalizeCartridge(raw) {
       for (const k of ["we", "wl", "wp"]) if (m[k] == null) m[k] = 1;
     }
   }
+  /* Optional timed run of the session. `at` is minutes remaining on the clock,
+     so the list is kept in firing order (highest first). */
+  if (isObj(s.schedule) && Array.isArray(s.schedule.items)) {
+    s.schedule = {
+      ...s.schedule,
+      autoByDefault: s.schedule.autoByDefault !== false,
+      items: s.schedule.items
+        .map((it, n) => (isObj(it) ? { ...it, id: it.id || `M-${n + 1}` } : it))
+        .sort((a, b) => (Number(b?.at) || 0) - (Number(a?.at) || 0)),
+    };
+  } else delete s.schedule;
   return s;
 }
 
@@ -295,6 +306,8 @@ export function enumeratePackages(s) {
   return out;
 }
 
+const SCHEDULE_KINDS = ["inject", "window", "announce", "note"];
+export const scheduleKind = (it) => SCHEDULE_KINDS.find((k) => it && it[k] != null && it[k] !== false) || null;
 
 /* ---- checks ---- */
 
@@ -395,6 +408,19 @@ export function checkCartridge(s) {
     if (!j.title || !j.body) hard(`${where} (${j.id}): title and body are required.`);
     if (j.mood != null && isObj(pd?.moods) && !pd.moods[j.mood]) hard(`${where} (${j.id}): mood "${j.mood}" isn't one of the moods.`);
   });
+
+  if (s.schedule != null) {
+    const items = isObj(s.schedule) && Array.isArray(s.schedule.items) ? s.schedule.items : null;
+    if (!items) hard("schedule needs an items list.");
+    else items.forEach((it, n) => {
+      const where = `Schedule item ${n + 1}${isObj(it) && it.id ? ` (${it.id})` : ""}`;
+      if (!isObj(it)) { hard(`${where} isn't an object.`); return; }
+      if (!(typeof it.at === "number" && it.at >= 0)) hard(`${where}: "at" must be the minutes remaining on the clock.`);
+      const kinds = SCHEDULE_KINDS.filter((k) => it[k] != null && it[k] !== false);
+      if (kinds.length !== 1) hard(`${where}: needs exactly one of inject, window, announce or note.`);
+      else if (kinds[0] === "inject" && !injIds.has(it.inject)) hard(`${where}: inject "${it.inject}" isn't one of the injects.`);
+    });
+  }
 
   if (JSON.stringify(s).length > MAX_CARTRIDGE_CHARS) hard(`The cartridge is larger than ${MAX_CARTRIDGE_CHARS / 1000} KB.`);
 
