@@ -1265,7 +1265,7 @@ button:focus-visible { outline: 2px solid #C1442E; outline-offset: 2px; }
 .pz-btn:active { transform: translateY(1px); }
 input, textarea, select { font-family: inherit; max-width: 100%; }
 /* Never scroll sideways: the page fits the viewport; anything wider scrolls inside its own box. */
-html, body, #root { max-width: 100vw; overflow-x: hidden; }
+html, body, #root { max-width: 100vw; overflow-x: clip; }  /* clip, not hidden: hidden would stop position: sticky */
 * { min-width: 0; }
 img, svg, video { max-width: 100%; }
 pre, code { white-space: pre-wrap; word-break: break-word; }
