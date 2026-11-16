@@ -30,3 +30,6 @@ samconfig.toml
 
 # Claude Code local settings and launch config
 .claude/
+
+# Scenario files hold delegations' private preferences
+scenarios/
