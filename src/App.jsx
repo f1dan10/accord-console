@@ -1268,6 +1268,8 @@ input, textarea, select { font-family: inherit; max-width: 100%; }
 html, body, #root { max-width: 100vw; overflow-x: clip; }  /* clip, not hidden: hidden would stop position: sticky */
 [id^="sec-"], [id^="pz-"] { scroll-margin-top: 4.5rem; }
 .pz-sidenav button:not(:disabled):hover { box-shadow: none; background: rgba(37,41,42,.08); }
+.pz-tab { border-bottom: 2px solid #F8BB04; }
+@media (min-width: 768px) { .pz-tab { border-bottom: 0; } }
 * { min-width: 0; }
 img, svg, video { max-width: 100%; }
 pre, code { white-space: pre-wrap; word-break: break-word; }
@@ -3267,13 +3269,20 @@ function TeamView({ team, sh, observer }) {
         </div>
       )}
 
-      <div className="flex">
-        {[["table", "Table"], ["draft", mine ? "Amend" : "Draft"], ["ministry", "Ministry"], ["wire", unseenCount > 0 ? `Wire (${unseenCount})` : "Wire"], ["gm", gmUnread > 0 ? `GM (${gmUnread})` : "GM"], ["calc", "Calc"]].map(([k, l]) => (
+      <div className="md:flex md:items-start">
+      <div className="flex md:flex-col md:shrink-0 md:gap-1 md:p-3" style={{ position: "sticky", top: 0, zIndex: 20, background: PAPER }}>
+        {[["table", "Table", "Table", 0], ["draft", mine ? "Amend" : "Draft", mine ? "Amend your draft" : "Draft a proposal", 0], ["ministry", "Ministry", "Ministry", winOpen && !filedThisWindow ? "!" : 0], ["wire", "Wire", "Wire", unseenCount], ["gm", "GM", "Gamemaster", gmUnread], ["calc", "Calc", "Calculator", 0]].map(([k, short, long, n]) => (
           <button key={k} onClick={() => { setTab(k); setMsg(""); if (k === "draft" && mine) setDraft(mine.terms); if (k === "wire") setSeenWireTs(Date.now()); if (k === "gm") setGmSeenTs(Date.now()); }}
-            className="flex-1 py-2.5 text-xs font-bold"
-            style={{ background: tab === k ? GOLD : "white", color: CHARCOAL, borderBottom: `2px solid ${GOLD}` }}>{l}</button>
+            aria-current={tab === k ? "true" : undefined}
+            className="pz-tab flex-1 md:flex-none py-2.5 md:px-3 md:rounded text-xs md:text-sm font-bold md:flex md:items-center md:justify-between md:gap-3"
+            style={{ background: tab === k ? GOLD : "white", color: CHARCOAL, textAlign: "left", minWidth: 0 }}>
+            <span className="md:hidden block text-center">{short}{n ? ` (${n})` : ""}</span>
+            <span className="hidden md:inline">{long}</span>
+            {n ? <span className="hidden md:inline px-1.5 rounded-full text-xs" style={{ background: RED, color: PAPER }}>{n}</span> : null}
+          </button>
         ))}
       </div>
+      <div className="flex-1" style={{ minWidth: 0, maxWidth: "60rem" }}>
 
       {unseenCount > 0 && tab !== "wire" && (
         <button onClick={() => { setTab("wire"); setSeenWireTs(Date.now()); }}
@@ -3567,6 +3576,8 @@ function TeamView({ team, sh, observer }) {
             )}
           </div>
         )}
+      </div>
+      </div>
       </div>
     </div>
   );
