@@ -1269,7 +1269,7 @@ html, body, #root { max-width: 100vw; overflow-x: clip; }  /* clip, not hidden: 
 [id^="sec-"], [id^="pz-"] { scroll-margin-top: 4.5rem; }
 .pz-sidenav button:not(:disabled):hover { box-shadow: none; background: rgba(37,41,42,.08); }
 .pz-tab { border-bottom: 2px solid #F8BB04; }
-@media (min-width: 768px) { .pz-tab { border-bottom: 0; } }
+@media (min-width: 768px) { .pz-tab { border-bottom: 0; } .pz-side { width: 13.5rem; } }
 * { min-width: 0; }
 img, svg, video { max-width: 100%; }
 pre, code { white-space: pre-wrap; word-break: break-word; }
@@ -3196,7 +3196,7 @@ function TeamView({ team, sh, observer }) {
   ].filter(Boolean);
 
   return (
-    <div className="min-h-screen pb-10" style={{ background: PAPER, color: CHARCOAL, fontFamily: BODY_HI }}>
+    <div className="min-h-screen pb-10" style={{ background: PAPER, color: CHARCOAL, fontFamily: BODY_HI, textAlign: "left" }}>
       <div className="flex justify-between items-center px-4 py-3" style={{ background: CHARCOAL, color: PAPER }}>
         <div>
           <div className="font-bold text-lg">{FLAGS[team]} {team} Delegation</div>
@@ -3270,7 +3270,7 @@ function TeamView({ team, sh, observer }) {
       )}
 
       <div className="md:flex md:items-start">
-      <div className="flex md:flex-col md:shrink-0 md:gap-1 md:p-3" style={{ position: "sticky", top: 0, zIndex: 20, background: PAPER }}>
+      <div className="pz-side flex md:flex-col md:shrink-0 md:gap-1 md:p-3" style={{ position: "sticky", top: 0, zIndex: 20, background: PAPER }}>
         {[["table", "Table", "Table", 0], ["draft", mine ? "Amend" : "Draft", mine ? "Amend your draft" : "Draft a proposal", 0], ["ministry", "Ministry", "Ministry", winOpen && !filedThisWindow ? "!" : 0], ["wire", "Wire", "Wire", unseenCount], ["gm", "GM", "Gamemaster", gmUnread], ["calc", "Calc", "Calculator", 0]].map(([k, short, long, n]) => (
           <button key={k} onClick={() => { setTab(k); setMsg(""); if (k === "draft" && mine) setDraft(mine.terms); if (k === "wire") setSeenWireTs(Date.now()); if (k === "gm") setGmSeenTs(Date.now()); }}
             aria-current={tab === k ? "true" : undefined}
@@ -3282,7 +3282,7 @@ function TeamView({ team, sh, observer }) {
           </button>
         ))}
       </div>
-      <div className="flex-1" style={{ minWidth: 0, maxWidth: "60rem" }}>
+      <div className="flex-1" style={{ minWidth: 0, maxWidth: "82rem" }}>
 
       {unseenCount > 0 && tab !== "wire" && (
         <button onClick={() => { setTab("wire"); setSeenWireTs(Date.now()); }}
