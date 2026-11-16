@@ -224,6 +224,15 @@ export function normalizeCartridge(raw) {
     catch { throw new CartridgeError("matrixB64 isn't valid base64-encoded JSON."); }
   }
   delete s.matrixB64;
+  /* Brown-build cartridges write each delegation's rankings on the delegation
+     itself (delegations[].row = { issueId: [rank per option] }) instead of a
+     top-level matrix. Same data, so fold it into `matrix`. */
+  if (s.matrix == null && Array.isArray(s.delegations) && s.delegations.some((d) => isObj(d) && isObj(d.row))) {
+    s.matrix = {};
+    for (const d of s.delegations) {
+      if (isObj(d) && isObj(d.row)) { s.matrix[d.id] = d.row; delete d.row; }
+    }
+  }
   /* Missing mode: an older cartridge, written before game types existed, and
      every one of those is an accord. Present but odd: trimmed and lowercased
      so "Standoff " matches, then left alone — checkCartridge rejects anything
@@ -242,10 +251,14 @@ export function normalizeCartridge(raw) {
       if (!isObj(m)) continue;
       m.favored = Array.isArray(m.favored) ? m.favored : [];
       m.penalized = Array.isArray(m.penalized) ? m.penalized : [];
+      /* Brown-build moods carry only a dispatch; grade the three rubric
+         dimensions evenly when no weights are given. */
+      for (const k of ["we", "wl", "wp"]) if (m[k] == null) m[k] = 1;
     }
   }
   return s;
 }
+
 
 /* ---- checks ---- */
 
