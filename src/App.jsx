@@ -6,6 +6,7 @@ import {
 import { api, API_CONFIGURED } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
 import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge, rankPoints, scheduleKind } from "./cartridge.js";
+import { channelsFor, appendMsg, newMsg, unreadCount, latestOther, tableKey, dmKey, CHAT_MAX_LEN } from "./chat.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
 import ScenarioWizard from "./ScenarioWizard.jsx";
 
@@ -1269,6 +1270,7 @@ html, body, #root { max-width: 100vw; overflow-x: clip; }  /* clip, not hidden: 
 [id^="sec-"], [id^="pz-"] { scroll-margin-top: 4.5rem; }
 .pz-sidenav button:not(:disabled):hover { box-shadow: none; background: rgba(37,41,42,.08); }
 .pz-tab { border-bottom: 2px solid #F8BB04; }
+@media (min-width: 768px) { .pz-chat-list { width: 13rem; } }
 @media (min-width: 768px) { .pz-tab { border-bottom: 0; } .pz-side { width: 13.5rem; } }
 * { min-width: 0; }
 img, svg, video { max-width: 100%; }
@@ -1956,12 +1958,19 @@ function Facilitator({ sh, game, onExit }) {
   useEffect(() => { (async () => setExemplars(await sGet(K.exemplars, [])))(); }, []);
   const [gmThreads, setGmThreads] = useState({});
   const [gmReplies, setGmReplies] = useState({});
+  /* Chat monitor: #table plus every delegation pair, all read-only except the GM's own posts in #table. */
+  const chatChans = [{ id: "table", label: "# table", key: tableKey(P) },
+    ...TEAMS.flatMap((a, i) => TEAMS.slice(i + 1).map((b) => ({ id: `${a}|${b}`, label: `${FLAGS[a]} ${a} ↔ ${FLAGS[b]} ${b}`, key: dmKey(P, a, b) })))];
+  const [chatLogs, setChatLogs] = useState({});
+  const [chatSel, setChatSel] = useState("table");
+  const [chatPost, setChatPost] = useState("");
   const { ann } = sh;
   useEffect(() => {
     let alive = true;
     const poll = async () => {
       const entries = await Promise.all(TEAMS.map(async (t) => [t, await sGet(gmKey(t), [])]));
-      if (alive) setGmThreads(Object.fromEntries(entries));
+      const logs = await Promise.all(chatChans.map(async (c) => [c.key, await sGet(c.key, [])]));
+      if (alive) { setGmThreads(Object.fromEntries(entries)); setChatLogs(Object.fromEntries(logs)); }
     };
     poll();
     const t = setInterval(poll, 6000);
@@ -2328,6 +2337,16 @@ function Facilitator({ sh, game, onExit }) {
       setGmThreads(Object.fromEntries(entries));
     });
   };
+  const postTable = () => {
+    const text = chatPost.trim();
+    if (!text) return;
+    return act("chat-post", async () => {
+      const m = newMsg("gm", text);
+      await sUpdate(tableKey(P), [], (l) => appendMsg(l, m), (l) => l.some((x) => x.id === m.id));
+      setChatPost("");
+      setChatLogs((p) => ({ ...p, [tableKey(P)]: appendMsg(p[tableKey(P)] || [], m) }));
+    });
+  };
   const resetAll = (confirmed) => {
     if (!confirmed) { setConfirmReset(true); return; }
     setConfirmReset(false);
@@ -2342,7 +2361,7 @@ function Facilitator({ sh, game, onExit }) {
       });
       aiMem.current = {};
       setSeatLocal({});
-      await writeDoc((d) => { for (const t of TEAMS) d[gmKey(t)] = []; return d; });
+      await writeDoc((d) => { for (const t of TEAMS) d[gmKey(t)] = []; for (const c of chatChans) d[c.key] = []; return d; });
     });
   };
 
@@ -2350,7 +2369,7 @@ function Facilitator({ sh, game, onExit }) {
   /* Delegations whose latest message to the gamemaster has no reply yet. */
   const awaitingN = TEAMS.filter((t) => { const th = gmThreads[t] || []; const lt = [...th].reverse().find((m) => m.from === "team"); return lt && !th.some((m) => m.from === "gm" && m.ts > lt.ts); }).length;
   const navGroups = [
-    ["Run the game", [["sec-clock", "Clock and session"], schedItems.length ? ["pz-schedule", "Schedule"] : null, ["sec-injects", "Injects"], ["pz-messages", "Messages"]].filter(Boolean)],
+    ["Run the game", [["sec-clock", "Clock and session"], schedItems.length ? ["pz-schedule", "Schedule"] : null, ["sec-injects", "Injects"], ["pz-messages", "Messages"], ["pz-chat", "Chat monitor"]].filter(Boolean)],
     ["Watch", [["sec-standings", "Standings"], ["pz-injects", "Filings"], ["sec-cred", "Credibility and mood"]]],
     ["Manage", [game ? ["sec-players", "Players"] : null, ["sec-seats", "Seats and overrides"], designer ? ["sec-calibration", "Calibration"] : null].filter(Boolean)],
   ];
@@ -2781,6 +2800,30 @@ function Facilitator({ sh, game, onExit }) {
             })}
           </div>
 
+          <div id="pz-chat" className="mt-4 mb-6">
+            <h3 className="font-bold tracking-wide mb-2">CHAT MONITOR <span className="font-normal text-xs opacity-60">(read-only; you can post in # table)</span></h3>
+            <select value={chatSel} onChange={(e) => setChatSel(e.target.value)} className="w-full px-2 py-1.5 rounded border text-sm mb-2" style={{ borderColor: GOLD, background: "white" }}>
+              {chatChans.map((c) => <option key={c.id} value={c.id}>{c.label} ({(chatLogs[c.key] || []).length})</option>)}
+            </select>
+            {(() => {
+              const c = chatChans.find((x) => x.id === chatSel) || chatChans[0];
+              const log = chatLogs[c.key] || [];
+              return (
+                <div className="space-y-1 max-h-64 overflow-y-auto p-2 rounded" style={{ background: "white", border: `1px solid ${LIGHTGOLD}` }}>
+                  {log.length === 0 && <div className="text-xs italic opacity-60">No messages.</div>}
+                  {log.map((m) => (
+                    <div key={m.id} className="text-xs"><b>{m.from === "gm" ? "You (GM)" : `${FLAGS[m.from] || ""} ${m.from}`}</b> <span className="opacity-60">{new Date(m.ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}</span> {m.text}</div>
+                  ))}
+                </div>
+              );
+            })()}
+            <div className="flex gap-1 mt-2">
+              <input value={chatPost} onChange={(e) => setChatPost(e.target.value.slice(0, CHAT_MAX_LEN))} onKeyDown={(e) => { if (e.key === "Enter") postTable(); }}
+                placeholder="Post to # table as the Gamemaster…" className="flex-1 px-2 py-1 rounded border text-xs" style={{ borderColor: GOLD, background: "white" }} />
+              <button onClick={postTable} disabled={!!busy || !chatPost.trim()} className="px-2 py-1 rounded text-xs font-bold" style={{ background: CHARCOAL, color: GOLD }}>Post</button>
+            </div>
+          </div>
+
           <h3 className="font-bold tracking-wide mb-2">GAMEMASTER ANNOUNCEMENT <span className="font-normal text-xs opacity-60">(pinned on every screen; not an inject)</span></h3>
           <textarea value={annText} onChange={(e) => setAnnText(e.target.value.slice(0, 300))} rows={2}
             placeholder="e.g. Breakout rooms close in 5 minutes — return to the main hall."
@@ -2997,6 +3040,68 @@ function TermForm({ terms, setTerms }) {
   );
 }
 
+/* Slack-style chat: channel list on the left (a chip row on phones), thread + composer on the right. */
+function ChatPanel({ chans, chat, active, setChanId, unreadOf, me, text, setText, send, busy, err, canAct }) {
+  const msgs = chat[active.key] || [];
+  const endRef = React.useRef(null);
+  const newest = msgs.length ? msgs[msgs.length - 1].id : "";
+  useEffect(() => { endRef.current && endRef.current.scrollIntoView({ block: "nearest" }); }, [newest, active.id]);
+  const who = (m) => (m.from === "gm" ? "Gamemaster" : m.from === "team" || m.from === me ? "You" : `${FLAGS[m.from] || ""} ${m.from}`.trim());
+  const mine = (m) => m.from === "team" || m.from === me;
+  const hhmm = (ts) => new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  const blurb = active.kind === "channel" ? "Everyone at the table and the Gamemaster can read this channel."
+    : active.kind === "gm" ? "A private line to the Gamemaster for rules questions and in-game requests. No delegation can see it."
+    : `Private between you and ${active.label}. The Gamemaster can monitor it.`;
+  const title = active.kind === "channel" ? "# table" : active.kind === "gm" ? "Gamemaster" : `${FLAGS[active.with] || ""} ${active.with}`.trim();
+  const canSend = canAct && text.trim().length > 0 && !busy;
+  return (
+    <div className="md:flex md:gap-4 md:items-stretch">
+      <div className="flex md:flex-col gap-1 overflow-x-auto md:overflow-visible mb-3 md:mb-0 md:shrink-0 pz-chat-list">
+        {chans.map((c) => {
+          const n = unreadOf(c);
+          const on = c.id === active.id;
+          return (
+            <button key={c.id} onClick={() => setChanId(c.id)} aria-current={on ? "true" : undefined}
+              className="flex items-center justify-between gap-2 px-3 py-2 rounded text-sm whitespace-nowrap"
+              style={{ background: on ? CHARCOAL : "white", color: on ? GOLD : CHARCOAL, fontWeight: n ? 700 : 500, textAlign: "left", boxShadow: "none", border: `1px solid ${on ? CHARCOAL : LIGHTGOLD}` }}>
+              <span>{c.kind === "channel" ? "# table" : c.kind === "gm" ? "◆ Gamemaster" : `${FLAGS[c.with] || ""} ${c.label}`}</span>
+              {n ? <span className="px-1.5 rounded-full text-xs font-bold" style={{ background: RED, color: PAPER }}>{n}</span> : null}
+            </button>
+          );
+        })}
+      </div>
+      <div className="flex-1 flex flex-col" style={{ minWidth: 0 }}>
+        <div className="font-bold">{title}</div>
+        <div className="text-xs opacity-70 mb-2">{blurb}</div>
+        <div className="rounded p-2 space-y-2 overflow-y-auto" style={{ background: "white", border: `1px solid ${LIGHTGOLD}`, height: "min(55vh, 32rem)" }}>
+          {msgs.length === 0 && <div className="opacity-60 italic text-sm p-2">No messages yet. Say something.</div>}
+          {msgs.map((m) => (
+            <div key={m.id} className={`flex ${mine(m) ? "justify-end" : ""}`}>
+              <div className="px-3 py-1.5 rounded text-sm" style={{ maxWidth: "80%", background: m.from === "gm" ? "#101314" : mine(m) ? LIGHTGOLD : PLATE, color: m.from === "gm" ? PAPER : CHARCOAL }}>
+                <div className="text-xs font-bold mb-0.5" style={{ color: m.from === "gm" ? GOLD : CHARCOAL, opacity: 0.8 }}>
+                  {who(m)} <span className="font-normal opacity-70">· {hhmm(m.ts)}</span>
+                </div>
+                <div className="pz-wrap" style={{ whiteSpace: "pre-wrap" }}>{m.text}</div>
+              </div>
+            </div>
+          ))}
+          <div ref={endRef} />
+        </div>
+        {err && <div className="text-xs font-bold mt-2" style={{ color: RED }}>{err}</div>}
+        <div className="flex gap-2 mt-2 items-end">
+          <textarea value={text} rows={2} disabled={!canAct}
+            onChange={(e) => setText(e.target.value.slice(0, CHAT_MAX_LEN))}
+            onKeyDown={(e) => { if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); if (canSend) send(); } }}
+            placeholder={canAct ? `Message ${active.kind === "channel" ? "#table" : title}…  (Enter to send, Shift+Enter for a new line)` : "View only"}
+            className="flex-1 px-2 py-2 rounded border text-sm" style={{ borderColor: GOLD, background: "white" }} />
+          <button onClick={send} disabled={!canSend} className="px-4 py-2.5 rounded font-bold"
+            style={{ background: canSend ? CHARCOAL : "#bbb", color: GOLD }}>Send</button>
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function TeamView({ team, sh, observer }) {
   const canAct = !observer;
   const { clock, props, endo, flags, pub, comms, injects, pull } = sh;
@@ -3010,9 +3115,13 @@ function TeamView({ team, sh, observer }) {
   const [seenWireTs, setSeenWireTs] = useState(() => Date.now());
   const [ackTs, setAckTs] = useState(() => Date.now());
   const [toasts, pushToast] = useToasts();
-  const [gmMsgs, setGmMsgs] = useState([]);
-  const [gmText, setGmText] = useState("");
-  const [gmSeenTs, setGmSeenTs] = useState(() => Date.now());
+  const [chat, setChat] = useState({});
+  const [chanId, setChanId] = useState("table");
+  const [chatText, setChatText] = useState("");
+  const [chatBusy, setChatBusy] = useState(false);
+  const [chatErr, setChatErr] = useState("");
+  const readKey = `${P}-chatread-${team}`;
+  const [lastRead, setLastRead] = useState(() => { try { return JSON.parse(localStorage.getItem(readKey) || "{}"); } catch { return {}; } });
   const [subject, setSubject] = useState(null);
   const [commText, setCommText] = useState("");
 
@@ -3057,17 +3166,38 @@ function TeamView({ team, sh, observer }) {
   const seatIsAi = (sh.aiCtl || {})[team] === "ai";
   const { ann } = sh;
 
+  /* Chat: every channel lives in the one shared doc, so reading them all is a single (cached) request. */
+  const chans = channelsFor(P, team, TEAMS, (t) => (sh.aiCtl || {})[t] !== "ai");
+  const chanSig = chans.map((c) => c.key).join("|");
+  const activeChan = chans.find((c) => c.id === chanId) || chans[0];
   useEffect(() => {
     let alive = true;
+    const keys = chanSig.split("|");
     const poll = async () => {
-      const m = await sGet(gmKey(team), []);
-      if (alive) setGmMsgs(m);
+      const entries = await Promise.all(keys.map(async (k) => [k, await sGet(k, [])]));
+      if (alive) setChat(Object.fromEntries(entries));
     };
     poll();
-    const t = setInterval(poll, 5000);
+    const t = setInterval(poll, tab === "chat" ? 3000 : 5000);
     return () => { alive = false; clearInterval(t); };
-  }, [team]);
-  const gmUnread = gmMsgs.filter((m) => m.from === "gm" && m.ts > gmSeenTs).length;
+  }, [chanSig, tab]);
+  /* Per-channel "read up to" = timestamp of the newest message seen (the sender's clock, so device clock skew can't hide messages). Kept in this browser only. */
+  useEffect(() => { try { localStorage.setItem(readKey, JSON.stringify(lastRead)); } catch { /* per-browser convenience */ } }, [lastRead, readKey]);
+  const newestOf = (c) => (chat[c.key] || []).reduce((m, x) => Math.max(m, x.ts), 0);
+  useEffect(() => {
+    if (!Object.keys(chat).length) return;
+    setLastRead((lr) => {
+      const next = { ...lr };
+      let changed = false;
+      for (const c of chans) {
+        const seen = tab === "chat" && c.id === activeChan.id;
+        if (next[c.id] === undefined || (seen && next[c.id] < newestOf(c))) { next[c.id] = newestOf(c); changed = true; }
+      }
+      return changed ? next : lr;
+    });
+  }, [chat, tab, chanId]); // eslint-disable-line react-hooks/exhaustive-deps
+  const unreadOf = (c) => (lastRead[c.id] === undefined || (tab === "chat" && c.id === activeChan.id) ? 0 : unreadCount(chat[c.key] || [], lastRead[c.id], team));
+  const chatUnread = chans.reduce((n, c) => n + unreadOf(c), 0);
 
   /* Event notifications (chime + toast) */
   const lastInjectTs = injects.length ? Math.max(...injects.map((j) => j.ts)) : 0;
@@ -3121,12 +3251,23 @@ function TeamView({ team, sh, observer }) {
     prevAnnTs.current = lastAnnTs;
   }, [lastAnnTs, pushToast]);
 
-  const lastGmTs = gmMsgs.length ? Math.max(...gmMsgs.filter((m) => m.from === "gm").map((m) => m.ts), 0) : 0;
-  const prevGmTs = React.useRef(lastGmTs);
+  /* Chat: chime + toast when another delegation or the GM writes in a channel I'm not looking at. */
+  const prevChat = React.useRef(null);
   useEffect(() => {
-    if (lastGmTs > prevGmTs.current) { SOUNDS.gm(); pushToast("◆ THE GAMEMASTER HAS REPLIED", LIGHTGOLD); }
-    prevGmTs.current = lastGmTs;
-  }, [lastGmTs, pushToast]);
+    if (!Object.keys(chat).length) return;
+    const cur = {};
+    for (const c of chans) cur[c.id] = latestOther(chat[c.key] || [], team);
+    const prev = prevChat.current;
+    if (prev) {
+      for (const c of chans) {
+        if (cur[c.id] > (prev[c.id] ?? cur[c.id]) && !(tab === "chat" && activeChan.id === c.id)) {
+          SOUNDS.gm();
+          pushToast(c.kind === "gm" ? "◆ THE GAMEMASTER HAS REPLIED" : c.kind === "channel" ? "◆ NEW MESSAGE IN #TABLE" : `◆ ${c.label.toUpperCase()} SENT YOU A MESSAGE`, LIGHTGOLD);
+        }
+      }
+    }
+    prevChat.current = cur;
+  }, [chat]); // eslint-disable-line react-hooks/exhaustive-deps
 
   /* Pending-reconfirmation notification: a draft I endorsed was amended */
   const myPendingIds = live.filter((p) => pendingList(endo, p.id).includes(team)).map((p) => p.id).join(",");
@@ -3175,15 +3316,22 @@ function TeamView({ team, sh, observer }) {
     setCommText(""); setPosture(null); setSubject(null); setRevising(null);
     await opFileCommunique(team, payload);
   }, revising ? "Revised statement filed. The press pool is re-reading…" : "Communiqué filed. The press pool is reading…");
-  const sendGm = () => act(async () => {
-    const mid = `${team}-${Date.now()}`;
-    await sUpdate(gmKey(team), [],
-      (m) => (m.some((x) => x.id === mid) ? m : [...m, { id: mid, from: "team", text: gmText.trim(), ts: Date.now() }]),
-      (m) => m.some((x) => x.id === mid));
-    setGmText("");
-    const m = await sGet(gmKey(team), []);
-    setGmMsgs(m);
-  }, "Message sent to the Gamemaster.");
+  const sendChat = async () => {
+    const text = chatText.trim();
+    if (!text || chatBusy || !canAct) return;
+    const c = activeChan;
+    /* The legacy GM thread marks a delegation's own messages from:"team". */
+    const m = newMsg(c.kind === "gm" ? "team" : team, text);
+    setChatBusy(true); setChatErr("");
+    setChat((p) => ({ ...p, [c.key]: appendMsg(p[c.key] || [], m) }));
+    setChatText("");
+    try {
+      const r = await sUpdate(c.key, [], (l) => appendMsg(l, m), (l) => l.some((x) => x.id === m.id));
+      if (!r) throw new Error("not-delivered");
+      setChat((p) => ({ ...p, [c.key]: r }));
+    } catch { setChatErr("That message may not have been delivered. Check it appears below, or send it again."); }
+    setChatBusy(false);
+  };
 
   const calcScore = complete(calc) ? scoreTerms(team, calc) : null;
   const myComms = comms.filter((c) => c.team === team);
@@ -3271,8 +3419,8 @@ function TeamView({ team, sh, observer }) {
 
       <div className="md:flex md:items-start">
       <div className="pz-side flex md:flex-col md:shrink-0 md:gap-1 md:p-3" style={{ position: "sticky", top: 0, zIndex: 20, background: PAPER }}>
-        {[["table", "Table", "Table", 0], ["draft", mine ? "Amend" : "Draft", mine ? "Amend your draft" : "Draft a proposal", 0], ["ministry", "Ministry", "Ministry", winOpen && !filedThisWindow ? "!" : 0], ["wire", "Wire", "Wire", unseenCount], ["gm", "GM", "Gamemaster", gmUnread], ["calc", "Calc", "Calculator", 0]].map(([k, short, long, n]) => (
-          <button key={k} onClick={() => { setTab(k); setMsg(""); if (k === "draft" && mine) setDraft(mine.terms); if (k === "wire") setSeenWireTs(Date.now()); if (k === "gm") setGmSeenTs(Date.now()); }}
+        {[["table", "Table", "Table", 0], ["draft", mine ? "Amend" : "Draft", mine ? "Amend your draft" : "Draft a proposal", 0], ["ministry", "Ministry", "Ministry", winOpen && !filedThisWindow ? "!" : 0], ["wire", "Wire", "Wire", unseenCount], ["chat", "Chat", "Chat", chatUnread], ["calc", "Calc", "Calculator", 0]].map(([k, short, long, n]) => (
+          <button key={k} onClick={() => { setTab(k); setMsg(""); if (k === "draft" && mine) setDraft(mine.terms); if (k === "wire") setSeenWireTs(Date.now()); }}
             aria-current={tab === k ? "true" : undefined}
             className="pz-tab flex-1 md:flex-none py-2.5 md:px-3 md:rounded text-xs md:text-sm font-bold md:flex md:items-center md:justify-between md:gap-3"
             style={{ background: tab === k ? GOLD : "white", color: CHARCOAL, textAlign: "left", minWidth: 0 }}>
@@ -3530,30 +3678,9 @@ function TeamView({ team, sh, observer }) {
           </div>
         )}
 
-        {tab === "gm" && (
-          <div>
-            <div className="text-sm opacity-75 mb-3">A private line to the Gamemaster for rules questions and in-game requests. No other delegation can see this conversation.</div>
-            <div className="space-y-2 mb-3 max-h-72 overflow-y-auto">
-              {gmMsgs.length === 0 && <div className="opacity-60 italic text-sm">No messages yet.</div>}
-              {gmMsgs.map((m) => (
-                <div key={m.id} className="p-2 rounded text-sm"
-                  style={m.from === "gm" ? { background: "#101314", color: PAPER } : { background: "white", background: PLATE }}>
-                  <div className="text-xs font-bold tracking-wide mb-0.5" style={{ color: m.from === "gm" ? GOLD : CHARCOAL, opacity: 0.8 }}>
-                    {m.from === "gm" ? "GAMEMASTER" : "YOUR DELEGATION"}
-                  </div>
-                  {m.text}
-                </div>
-              ))}
-            </div>
-            <textarea value={gmText} onChange={(e) => setGmText(e.target.value.slice(0, 500))} rows={3}
-              placeholder="Ask the Gamemaster…"
-              className="w-full px-2 py-2 rounded border text-sm mb-2" style={{ borderColor: GOLD, background: "white" }} />
-            <button onClick={sendGm} disabled={busy || gmText.trim().length < 2 || !canAct}
-              className="w-full py-2.5 rounded font-bold"
-              style={{ background: gmText.trim().length >= 2 ? CHARCOAL : "#bbb", color: GOLD }}>
-              Send to Gamemaster
-            </button>
-          </div>
+        {tab === "chat" && (
+          <ChatPanel chans={chans} chat={chat} active={activeChan} setChanId={setChanId} unreadOf={unreadOf}
+            me={team} text={chatText} setText={setChatText} send={sendChat} busy={chatBusy} err={chatErr} canAct={canAct} />
         )}
 
         {tab === "calc" && (
