@@ -259,6 +259,42 @@ export function normalizeCartridge(raw) {
   return s;
 }
 
+/* ---- deal scoring (pure; the engine in App.jsx and the tests both use it) ---- */
+
+/* Points a ranked option earns: first choice the full weight, last choice
+   nothing, even steps between. (Before v1.6 the last choice still earned
+   weight / n.) */
+export const rankPoints = (nOptions, rank, weight) =>
+  (nOptions > 1 ? ((nOptions - rank) * weight) / (nOptions - 1) : weight);
+
+const baseIssueWeight = (iss) => (iss.type === "ranked" ? iss.options.length : (iss.weight ?? 2));
+
+/* A delegation's deal score for a package, 0–100 unrounded, before the
+   mediator's closure share and before credibility. terms = { issueId: optionIndex }. */
+export function rawDealPct(s, teamId, terms) {
+  const d = s.delegations.find((x) => x.id === teamId);
+  const pw = (s.scoring && s.scoring.priorityWeight) || 2;
+  let total = 0, max = 0;
+  for (const iss of s.issues) {
+    const w = baseIssueWeight(iss) * (d && d.priority === iss.id ? pw : 1);
+    max += w;
+    const v = terms[iss.id];
+    if (v == null) continue;
+    const m = s.matrix[teamId][iss.id];
+    total += iss.type === "ranked" ? rankPoints(iss.options.length, m[v], w) : (v === m ? w : 0);
+  }
+  return max ? (total / max) * 100 : 0;
+}
+
+/* Every possible package, as { issueId: optionIndex }. */
+export function enumeratePackages(s) {
+  let out = [{}];
+  for (const iss of s.issues) {
+    out = out.flatMap((t) => iss.options.map((_, k) => ({ ...t, [iss.id]: k })));
+  }
+  return out;
+}
+
 
 /* ---- checks ---- */
 

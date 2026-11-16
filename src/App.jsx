@@ -5,7 +5,7 @@ import {
 } from "./auth.js";
 import { api, API_CONFIGURED } from "./api.js";
 import { setActiveGame, getActiveGame } from "./storage.js";
-import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge } from "./cartridge.js";
+import { normalizeCartridge, designRules, readCartridgeFile, summarize, blankCartridge, rankPoints } from "./cartridge.js";
 import ScenarioEditor from "./ScenarioEditor.jsx";
 import ScenarioWizard from "./ScenarioWizard.jsx";
 
@@ -250,7 +250,7 @@ function scoreTerms(team, t) {
     const v = t[iss.id];
     let pts = 0;
     if (v != null) {
-      if (iss.type === "ranked") pts = (iss.options.length + 1 - m[iss.id][v]) * (w / issueWeight(iss));
+      if (iss.type === "ranked") pts = rankPoints(iss.options.length, m[iss.id][v], w); // v1.6: last choice earns 0
       else pts = v === m[iss.id] ? w : 0;
     }
     parts.push([shortLabel(iss), pts, w]);
